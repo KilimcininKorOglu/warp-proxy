@@ -38,6 +38,11 @@ type BridgeConfig struct {
 	MaxConcurrent int    `yaml:"max_concurrent"`
 	MinInterval   string `yaml:"min_interval"`
 	Timeout       string `yaml:"timeout"`
+	// InjectSession adds the OpenCode free-tier identity to upstream
+	// requests that do not already carry it: the X-Opencode-Session and
+	// X-Opencode-Request headers, an opencode User-Agent, and stub tool
+	// entries. Values sent by the client are respected.
+	InjectSession bool `yaml:"inject_session"`
 }
 
 // TimeoutDur parses the configured upstream timeout.
@@ -176,6 +181,7 @@ func Defaults() *Config {
 			MaxConcurrent: 3,
 			MinInterval:   "0.5s",
 			Timeout:       "120s",
+			InjectSession: true,
 		},
 		Auth: AuthConfig{Username: "admin"},
 	}

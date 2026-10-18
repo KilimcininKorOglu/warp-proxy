@@ -57,40 +57,46 @@ func TestRetryable(t *testing.T) {
 	}
 }
 
-// fixture wires a bridge Server to a scripted upstream through the SOCKS5
-// fake, reimplemented here for isolation.
-func fixture(t *testing.T, upstreamHandler http.HandlerFunc, rotations *atomic.Int32) *httptest.Server {
+// startBridge wires a bridge Server to a scripted upstream through the SOCKS5
+// fake (the warp-cli stand-in) and returns the client-facing bridge server.
+// inject toggles free-tier session injection; retryAttempts bounds replays.
+func startBridge(t *testing.T, upstreamHandler http.HandlerFunc,
+	rotate func(context.Context) error, inject bool, retryAttempts int) *httptest.Server {
 	t.Helper()
 
-	// Fake SOCKS5 upstream (warp-cli stand-in).
 	socksLn := fakeSocks(t)
-
-	// The actual AI upstream behind the SOCKS proxy.
 	upstream := httptest.NewServer(upstreamHandler)
 	t.Cleanup(upstream.Close)
 
-	logs := logbuf.New(32)
-	rotate := func(ctx context.Context) error {
-		rotations.Add(1)
-		return nil
-	}
 	cfg := func() config.BridgeConfig {
 		return config.BridgeConfig{
 			Enabled:       true,
 			Upstream:      upstream.URL,
 			RetryStatuses: []int{429},
-			RetryAttempts: 1,
+			RetryAttempts: retryAttempts,
 			MaxConcurrent: 3,
 			MinInterval:   "0s",
 			Timeout:       "10s",
+			InjectSession: inject,
 		}
 	}
 	srv := New(&proxy.Upstream{Addr: socksLn, Timeout: 5 * time.Second},
-		logs, discardLogger(), rotate, cfg)
+		logbuf.New(32), discardLogger(), rotate, cfg)
 
 	bridge := httptest.NewServer(srv)
 	t.Cleanup(bridge.Close)
 	return bridge
+}
+
+// fixture wires a bridge Server to a scripted upstream through the SOCKS5
+// fake, reimplemented here for isolation.
+func fixture(t *testing.T, upstreamHandler http.HandlerFunc, rotations *atomic.Int32) *httptest.Server {
+	t.Helper()
+	rotate := func(context.Context) error {
+		rotations.Add(1)
+		return nil
+	}
+	return startBridge(t, upstreamHandler, rotate, false, 1)
 }
 
 func TestForwardsAndPreservesHeaders(t *testing.T) {

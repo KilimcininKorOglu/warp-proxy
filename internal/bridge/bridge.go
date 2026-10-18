@@ -1,8 +1,10 @@
 // Package bridge exposes an OpenAI-compatible reverse proxy that forwards
 // requests to a configured upstream through WARP and replays a request
 // after a WARP IP rotation when the upstream answers with a retryable
-// status such as 429. Requests are forwarded exactly as received; the
-// bridge never invents or replaces headers.
+// status such as 429. Requests are forwarded unchanged, except for the
+// OpenCode free-tier identity (session/request headers, User-Agent and tool
+// stubs) which is added when session injection is on and the client did not
+// provide it.
 package bridge
 
 import (
@@ -67,6 +69,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Add the free-tier tool stubs before the request is (possibly) replayed,
+	// so every attempt carries the same body.
+	if cfg.InjectSession {
+		body = ensureTools(body)
+	}
+	ids := newIdentity(cfg)
+
 	if err := s.acquire(r.Context(), cfg); err != nil {
 		http.Error(w, "bridge busy: "+err.Error(), http.StatusServiceUnavailable)
 		return
@@ -77,7 +86,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var resp *http.Response
 	var replayErr error
 	for attempt := 0; attempt <= attempts; attempt++ {
-		resp, replayErr = s.roundTrip(r, body, cfg)
+		resp, replayErr = s.roundTrip(r, body, cfg, ids)
 		if replayErr != nil {
 			break
 		}
@@ -113,7 +122,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // roundTrip forwards the buffered request to the upstream once.
-func (s *Server) roundTrip(r *http.Request, body []byte, cfg config.BridgeConfig) (*http.Response, error) {
+func (s *Server) roundTrip(r *http.Request, body []byte, cfg config.BridgeConfig, ids *identity) (*http.Response, error) {
 	ctx, cancel := context.WithTimeout(r.Context(), cfg.TimeoutDur())
 	defer cancel()
 
@@ -126,6 +135,7 @@ func (s *Server) roundTrip(r *http.Request, body []byte, cfg config.BridgeConfig
 		return nil, err
 	}
 	copyHeaders(req.Header, r.Header)
+	ids.apply(req.Header)
 	req.Host = req.URL.Host
 
 	transport := &http.Transport{DialContext: s.Upstream.Dial}

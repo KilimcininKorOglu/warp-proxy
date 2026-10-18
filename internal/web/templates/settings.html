@@ -40,7 +40,10 @@
     <tr><th>Front cache TTL</th><td><input type="text" name="front_cache_ttl" value="{{.Cfg.Front.ResolveCacheTTL}}"></td></tr>
     <tr><th>AI bridge</th>
       <td><label><input type="checkbox" name="bridge_enabled" {{if .Cfg.Bridge.Enabled}}checked{{end}} style="width:auto"> açık</label>
-      <div class="muted">OpenAI-uyumlu reverse proxy: upstream 429 dönerse WARP IP'sini çevirip isteği tekrar eder. İstekler olduğu gibi iletilir; header eklenmez.</div></td></tr>
+      <div class="muted">OpenAI-uyumlu reverse proxy: upstream 429 dönerse WARP IP'sini çevirip isteği tekrar eder. İstekler olduğu gibi iletilir; yalnız free-tier kimlik enjeksiyonu açıkken header eklenir.</div></td></tr>
+    <tr><th>Free-tier enjeksiyonu</th>
+      <td><label><input type="checkbox" name="bridge_inject_session" {{if .Cfg.Bridge.InjectSession}}checked{{end}} style="width:auto"> açık</label>
+      <div class="muted">Her upstream isteğine X-Opencode-Session, X-Opencode-Request, opencode User-Agent ve eksik tool stub'larını ekler. İstemcinin gönderdiği değerler korunur.</div></td></tr>
     <tr><th>Bridge portu</th><td><input type="text" name="bridge_listen" value="{{.Cfg.Bridge.Listen}}"></td></tr>
     <tr><th>Bridge upstream</th><td><input type="text" name="bridge_upstream" value="{{.Cfg.Bridge.Upstream}}"></td></tr>
     <tr><th>Retry statusleri</th><td><input type="text" name="bridge_retry_statuses" value="{{range $i, $s := .Cfg.Bridge.RetryStatuses}}{{if $i}},{{end}}{{$s}}{{end}}">

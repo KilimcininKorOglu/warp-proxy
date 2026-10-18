@@ -48,8 +48,11 @@ browser --> :8590 panel
   :8593 that forwards requests to the configured upstream through WARP.
   When the upstream answers with a retryable status (429 by default), it
   rotates the WARP exit IP and replays the request once, honoring
-  `Retry-After`. Requests are forwarded unchanged; the bridge adds no
-  headers.
+  `Retry-After`. Requests are forwarded unchanged, except for the OpenCode
+  free-tier identity (`bridge.inject_session`, on by default): the bridge
+  adds the `X-Opencode-Session` and `X-Opencode-Request` headers, an
+  opencode `User-Agent` and stub tool entries when the client did not
+  provide them. Values the client sends are never overwritten.
 
 ## Using the AI bridge with opencode
 
@@ -75,6 +78,24 @@ and replays automatically (rate-limited, `bridge.retry_attempts`). Any
 OpenAI-compatible client works the same way: set its base URL to
 `http://HOST:8593/v1`. The upstream, retry statuses and limits are editable
 in the panel's settings page.
+
+## Free-tier session headers
+
+OpenCode's free tier keys anonymous traffic on the `X-Opencode-Session`
+header; a bare request that lacks it lands in the anonymous quota and can be
+rejected with `FreeUsageLimitError`. When `bridge.inject_session` is on (the
+default), the bridge adds, on every upstream request that does not already
+carry them:
+
+- `X-Opencode-Session` — `ses_` followed by 26 digits
+- `X-Opencode-Request` — `msg_` followed by 24 alphanumeric characters
+- an opencode `User-Agent` (an empty or non-opencode one is replaced)
+- stub entries in the `tools` array of chat bodies (the free gateway
+  requires at least two)
+
+Values sent by the client are respected and never overwritten; the ids are
+generated once per request so a replay keeps the same session. Toggle the
+whole feature off with `inject_session: false` in the config or the panel.
 
 ## Run
 

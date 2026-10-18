@@ -256,6 +256,7 @@ func applyForm(cfg *config.Config, r *http.Request) {
 	cfg.Bridge.MaxConcurrent = formIntOr(r, "bridge_max_concurrent", cfg.Bridge.MaxConcurrent)
 	cfg.Bridge.MinInterval = formOr(r, "bridge_min_interval", cfg.Bridge.MinInterval)
 	cfg.Bridge.Timeout = formOr(r, "bridge_timeout", cfg.Bridge.Timeout)
+	cfg.Bridge.InjectSession = r.FormValue("bridge_inject_session") == "on"
 }
 
 // parseInts parses a comma-separated integer list; an empty or invalid

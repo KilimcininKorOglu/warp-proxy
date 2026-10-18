@@ -52,9 +52,8 @@ front:
 
 # AI bridge: an OpenAI-compatible reverse proxy that forwards requests to
 # the upstream through WARP and replays after a WARP IP rotation when the
-# upstream answers with a retryable status (429). Requests are forwarded
-# unchanged; the bridge adds no headers. Point the AI client's baseURL at
-# http://<host>:8593/v1.
+# upstream answers with a retryable status (429). Point the AI client's
+# baseURL at http://<host>:8593/v1.
 bridge:
   enabled: true
   listen: ":8593"
@@ -64,6 +63,10 @@ bridge:
   max_concurrent: 3
   min_interval: "0.5s"
   timeout: "120s"
+  # Free-tier identity: add X-Opencode-Session, X-Opencode-Request, an
+  # opencode User-Agent and stub tool entries to upstream requests that do
+  # not already carry them. Values sent by the client are respected.
+  inject_session: true
 
 # Panel login. The password is written on first start from the
 # WARP_PROXY_PASSWORD environment variable; only the bcrypt hash is stored.
