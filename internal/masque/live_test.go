@@ -6,6 +6,8 @@ import (
 	"crypto/tls"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -221,5 +223,101 @@ func TestLiveAppFlow(t *testing.T) {
 		}
 		t.Logf("round %d: %q", round, buf[:min(n, 40)])
 		time.Sleep(2 * time.Second)
+	}
+}
+
+// TestLiveEgressPerEndpoint reports the WARP egress for two different edge
+// endpoints with the same identity: same IP means the egress keys on the
+// client, different IPs mean the pool can spread across edges.
+func TestLiveEgressPerEndpoint(t *testing.T) {
+	liveGuard(t)
+	id := loadLiveIdentity(t)
+	for _, ep := range []string{"", "162.159.198.1:443", "162.159.192.1:443"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		tun, err := Dial(ctx, id, ep)
+		if err != nil {
+			cancel()
+			t.Logf("endpoint %q: dial: %v", ep, err)
+			continue
+		}
+		d, derr := NewNetstackDialer(tun, id)
+		if derr != nil {
+			tun.Close()
+			cancel()
+			continue
+		}
+		conn, cerr := d.Dial(ctx, "tcp", "1.1.1.1:53")
+		if cerr != nil {
+			tun.Close()
+			cancel()
+			t.Logf("endpoint %q: dial: %v", ep, cerr)
+			continue
+		}
+		conn.Close()
+		// UDP DNS via netstack for whoami TXT.
+		resp, rerr := d.dnsExchange(ctx, BuildTXTQuery("whoami.cloudflare"))
+		if rerr != nil {
+			t.Logf("endpoint %q: dns: %v", ep, rerr)
+			tun.Close()
+			cancel()
+			continue
+		}
+		txt, terr := parseTXTFromMessage(resp)
+		if terr != nil {
+			t.Logf("endpoint %q: parse: %v", ep, terr)
+			tun.Close()
+			cancel()
+			continue
+		}
+		tun.Close()
+		cancel()
+		t.Logf("endpoint %q -> egress %q", ep, txt)
+	}
+}
+
+// TestLiveEgressPerAccount reports the WARP egress of every stored
+// identity: distinct IPs make the pool useful, identical ones mean
+// Cloudflare keys the egress on the client host.
+func TestLiveEgressPerAccount(t *testing.T) {
+	liveGuard(t)
+	dir := os.Getenv("MASQUE_STATE")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		id, err := LoadIdentityAt(filepath.Join(dir, name))
+		if err != nil {
+			t.Logf("%s: load: %v", name, err)
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		tun, err := Dial(ctx, id, "")
+		if err != nil {
+			cancel()
+			t.Logf("%s: tunnel: %v", name, err)
+			continue
+		}
+		d, derr := NewNetstackDialer(tun, id)
+		if derr != nil {
+			tun.Close()
+			cancel()
+			continue
+		}
+		resp, rerr := d.dnsExchange(ctx, BuildTXTQuery("whoami.cloudflare"))
+		if rerr != nil {
+			t.Logf("%s: dns: %v", name, rerr)
+			tun.Close()
+			cancel()
+			continue
+		}
+		txt, _ := parseTXTFromMessage(resp)
+		t.Logf("%s -> egress %q", name, txt)
+		tun.Close()
+		cancel()
 	}
 }

@@ -106,10 +106,21 @@ func parseDNSAnswerTXT(resp []byte) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	ancount := int(binary.BigEndian.Uint16(d[6:8]))
+	return parseTXTFromMessage(d)
+}
+
+// parseTXTFromMessage returns the first TXT string of a bare DNS message.
+func parseTXTFromMessage(d []byte) (string, error) {
+	if len(d) < 12 || d[0] != byte(dnsID>>8&0xff) || d[1] != byte(dnsID&0xff) {
+		return "", errNotOurDNS
+	}
+	if d[2]&0x80 == 0 {
+		return "", errNotOurDNS
+	}
 	if rcode := d[3] & 0x0f; rcode != 0 {
 		return "", fmt.Errorf("dns rcode %d", rcode)
 	}
+	ancount := int(binary.BigEndian.Uint16(d[6:8]))
 	off := skipQuestion(d)
 	for i := 0; i < ancount && off+10 <= len(d); i++ {
 		off = skipName(d, off)

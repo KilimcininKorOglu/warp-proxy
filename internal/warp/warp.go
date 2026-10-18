@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"strconv"
@@ -141,8 +142,10 @@ func (m *Manager) pickDialer() (Dialer, error) {
 	}
 	start := int(m.rr.Add(1)) % n
 	for i := 0; i < n; i++ {
-		w := m.workers[(start+i)%n]
+		idx := (start + i) % n
+		w := m.workers[idx]
 		if w != nil && w.d != nil {
+			h2Debug("dial via worker %d", idx)
 			return w.d, nil
 		}
 	}
@@ -411,6 +414,13 @@ func (m *Manager) poolSize() int {
 		return 1
 	}
 	return m.accounts
+}
+
+// h2Debug logs pool decisions when MASQUE_DEBUG=1.
+func h2Debug(format string, args ...any) {
+	if os.Getenv("MASQUE_DEBUG") == "1" {
+		log.Printf("warp: "+format, args...)
+	}
 }
 
 // ErrNotConnected is returned when the tunnel should be up but is not.
