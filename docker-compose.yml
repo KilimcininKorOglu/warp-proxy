@@ -5,7 +5,6 @@ services:
     build: .
     container_name: warp-proxy
     restart: unless-stopped
-    privileged: true
     environment:
       # First-run only: sets the panel password (stored as a bcrypt hash).
       WARP_PROXY_PASSWORD: ${WARP_PROXY_PASSWORD:?set WARP_PROXY_PASSWORD in .env}
@@ -15,10 +14,11 @@ services:
       - "8592:8592" # SOCKS5 proxy
       - "8593:8593" # AI bridge (OpenAI-compatible, rotate-on-429)
     volumes:
-      - warp-registration:/var/lib/cloudflare-warp
+      # Device identity state (the WARP registration), persisted.
+      - warp-state:/etc/warp-proxy/state
       # Directory mount, not a single file: the app saves its config
       # atomically (temp file + rename), which fails on a file bind mount.
       - ./config:/etc/warp-proxy
 
 volumes:
-  warp-registration:
+  warp-state:
