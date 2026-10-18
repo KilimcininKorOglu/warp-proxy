@@ -35,37 +35,50 @@ const (
 	// h3SettingDatagram00 is the legacy H3 datagram setting id the official
 	// client still advertises.
 	h3SettingDatagram00 = 0x276
-	// MaxIPPacket bounds the packet we hand to sendIP; QUIC datagram budget
-	// (~1222) minus the context-id varint, rounded down for safety.
+	// MaxIPPacket bounds the packet handed to a tunnel's SendIP. Over H3 it
+	// is the QUIC datagram budget (~1222) minus the context-id varint; over
+	// H2 it stays under a typical TCP segment.
 	MaxIPPacket = 1200
 )
 
-// Tunnel is an established MASQUE CONNECT-IP session. IP packets are
-// exchanged as HTTP/3 datagrams framed `varint(context_id=0) || packet`
-// (quic-go adds the quarter-stream-id prefix itself).
+// Tunnel is an established MASQUE CONNECT-IP session over either transport.
 type Tunnel struct {
-	conn       *quic.Conn
-	client     *http3.ClientConn
-	stream     *http3.RequestStream
-	transport  *http3.Transport
-	qTransport *quic.Transport
-	udpConn    *net.UDPConn
-	cancel     context.CancelFunc
-	status     int
+	send   func([]byte) error
+	recv   func(context.Context) ([]byte, error)
+	closer func() error
+	status int
 }
 
-// Dial establishes the tunnel against id's endpoint (or endpointOverride
-// "host:port" when non-empty): QUIC dial with mTLS + pubkey pinning, then the
-// extended CONNECT. A 200 response opens the session.
+// Dial establishes the tunnel: H3 (QUIC) first, H2 fallback when the QUIC
+// path cannot complete (QUIC-blocked networks, or edges that silently drop
+// foreign QUIC fingerprints). endpointOverride is "host:port" for the H3
+// endpoint when non-empty.
 func Dial(ctx context.Context, id *Identity, endpointOverride string) (*Tunnel, error) {
-	endpoint := endpointOverride
-	if endpoint == "" {
-		var err error
-		if endpoint, err = id.TunnelEndpoint(); err != nil {
-			return nil, err
-		}
+	conf, err := tunnelTLSConf(id)
+	if err != nil {
+		return nil, err
 	}
+	var h3Err, h2Err error
+	t, err := dialH3(ctx, id, conf, endpointOverride)
+	if err == nil {
+		return t, nil
+	}
+	h3Err = err
+	t, err = dialH2(ctx, id, conf)
+	if err == nil {
+		return t, nil
+	}
+	h2Err = err
+	return nil, fmt.Errorf("h3: %v; h2: %v", h3Err, h2Err)
+}
+
+// tunnelTLSConf builds the mTLS + pinning TLS config shared by both paths.
+func tunnelTLSConf(id *Identity) (*tls.Config, error) {
 	kp, err := id.Keypair()
+	if err != nil {
+		return nil, err
+	}
+	cert, err := selfSignedCert(kp.Key())
 	if err != nil {
 		return nil, err
 	}
@@ -73,20 +86,57 @@ func Dial(ctx context.Context, id *Identity, endpointOverride string) (*Tunnel, 
 	if err != nil {
 		return nil, fmt.Errorf("endpoint_pub_key: %w", err)
 	}
-	cert, err := selfSignedCert(kp.Key())
-	if err != nil {
-		return nil, err
-	}
-	tlsConf := &tls.Config{
+	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		ServerName:   ConnectSNI,
-		NextProtos:   []string{"h3"},
 		// The endpoint is trusted by key pinning, not PKI: the SNI does not
 		// match the endpoint IP.
 		InsecureSkipVerify:    true,
 		VerifyPeerCertificate: pinVerifier(pinned),
 		MinVersion:            tls.VersionTLS13,
+	}, nil
+}
+
+// Status reports the HTTP status of the extended CONNECT.
+func (t *Tunnel) Status() int { return t.status }
+
+// SendIP sends one IP packet through the tunnel.
+func (t *Tunnel) SendIP(packet []byte) error {
+	if len(packet) > MaxIPPacket {
+		return fmt.Errorf("ip packet %d bytes exceeds tunnel budget %d",
+			len(packet), MaxIPPacket)
 	}
+	return t.send(packet)
+}
+
+// RecvIP receives one IP packet from the tunnel.
+func (t *Tunnel) RecvIP(ctx context.Context) ([]byte, error) {
+	return t.recv(ctx)
+}
+
+// Close tears the tunnel down.
+func (t *Tunnel) Close() error {
+	if t.closer != nil {
+		return t.closer()
+	}
+	return nil
+}
+
+// dialH3 establishes the MASQUE session over HTTP/3 datagrams: QUIC dial
+// with mTLS + pubkey pinning, then the extended CONNECT. IP packets are
+// exchanged as HTTP/3 datagrams framed `varint(context_id=0) || packet`
+// (quic-go adds the quarter-stream-id prefix itself).
+func dialH3(ctx context.Context, id *Identity, conf *tls.Config,
+	endpointOverride string) (*Tunnel, error) {
+	endpoint := endpointOverride
+	if endpoint == "" {
+		var err error
+		if endpoint, err = id.TunnelEndpoint(); err != nil {
+			return nil, err
+		}
+	}
+	tlsConf := conf.Clone()
+	tlsConf.NextProtos = []string{"h3"}
 	quicConf := &quic.Config{
 		EnableDatagrams: true,
 		KeepAlivePeriod: 15 * time.Second,
@@ -102,16 +152,18 @@ func Dial(ctx context.Context, id *Identity, endpointOverride string) (*Tunnel, 
 		Conn:               udpConn,
 		ConnectionIDLength: quicCIDLength,
 	}
+	fail := func(e error) (*Tunnel, error) {
+		qTransport.Close()
+		udpConn.Close()
+		return nil, e
+	}
 	addr, err := net.ResolveUDPAddr("udp", endpoint)
 	if err != nil {
-		udpConn.Close()
-		return nil, fmt.Errorf("resolve endpoint %s: %w", endpoint, err)
+		return fail(fmt.Errorf("resolve endpoint %s: %w", endpoint, err))
 	}
 	conn, err := qTransport.Dial(ctx, addr, tlsConf, quicConf)
 	if err != nil {
-		qTransport.Close()
-		udpConn.Close()
-		return nil, fmt.Errorf("quic dial %s: %w", endpoint, err)
+		return fail(fmt.Errorf("quic dial %s: %w", endpoint, err))
 	}
 	transport := &http3.Transport{
 		TLSClientConfig:    tlsConf,
@@ -121,15 +173,14 @@ func Dial(ctx context.Context, id *Identity, endpointOverride string) (*Tunnel, 
 	}
 	client := transport.NewClientConn(conn)
 
-	// The CONNECT stream is the tunnel's lifetime; cancel is released when
-	// the tunnel closes (Close cancels the stream, ending the request).
+	// The CONNECT stream is the tunnel's lifetime; its context is decoupled
+	// from the dial context and released by Tunnel.Close.
 	reqCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	t := &Tunnel{cancel: cancel}
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodConnect, ConnectURI, nil)
 	if err != nil {
 		conn.CloseWithError(quic.ApplicationErrorCode(0), "setup failed")
 		cancel()
-		return nil, err
+		return fail(err)
 	}
 	req.Proto = ConnectProtocol
 	req.Header.Set("Capsule-Protocol", "?1")
@@ -139,90 +190,56 @@ func Dial(ctx context.Context, id *Identity, endpointOverride string) (*Tunnel, 
 	if err != nil {
 		conn.CloseWithError(quic.ApplicationErrorCode(0), "setup failed")
 		cancel()
-		return nil, fmt.Errorf("open request stream: %w", err)
+		return fail(fmt.Errorf("open request stream: %w", err))
 	}
 	if err := stream.SendRequestHeader(req); err != nil {
 		conn.CloseWithError(quic.ApplicationErrorCode(0), "setup failed")
 		cancel()
-		return nil, fmt.Errorf("send extended CONNECT: %w", err)
+		return fail(fmt.Errorf("send extended CONNECT: %w", err))
 	}
 	resp, err := stream.ReadResponse()
 	if err != nil {
 		conn.CloseWithError(quic.ApplicationErrorCode(0), "setup failed")
 		cancel()
-		return nil, fmt.Errorf("read CONNECT response: %w", err)
+		return fail(fmt.Errorf("read CONNECT response: %w", err))
 	}
 	if resp.StatusCode != http.StatusOK {
 		conn.CloseWithError(quic.ApplicationErrorCode(0), "connect rejected")
 		cancel()
-		return nil, fmt.Errorf("MASQUE CONNECT rejected: %d", resp.StatusCode)
+		return fail(fmt.Errorf("MASQUE CONNECT rejected: %d", resp.StatusCode))
 	}
-	t.conn = conn
-	t.client = client
-	t.stream = stream
-	t.transport = transport
-	t.qTransport = qTransport
-	t.udpConn = udpConn
-	t.status = resp.StatusCode
-	return t, nil
-}
-
-// Status reports the HTTP status of the extended CONNECT.
-func (t *Tunnel) Status() int { return t.status }
-
-// SendIP sends one IP packet through the tunnel, framed with context id 0.
-func (t *Tunnel) SendIP(packet []byte) error {
-	if len(packet) > MaxIPPacket {
-		return fmt.Errorf("ip packet %d bytes exceeds tunnel budget %d",
-			len(packet), MaxIPPacket)
-	}
-	buf := quicvarint.Append(nil, 0) // context id 0: full, uncompressed packet
-	buf = append(buf, packet...)
-	return t.stream.SendDatagram(buf)
-}
-
-// RecvIP receives one IP packet from the tunnel, skipping datagrams with a
-// non-zero context id. SendIP prepends the context-id varint (quic-go
-// already stripped the quarter-stream-id prefix).
-func (t *Tunnel) RecvIP(ctx context.Context) ([]byte, error) {
-	for {
-		b, err := t.stream.ReceiveDatagram(ctx)
-		if err != nil {
-			return nil, err
-		}
-		ctxID, n, err := quicvarint.Parse(b)
-		if err != nil || ctxID != 0 {
-			continue
-		}
-		return b[n:], nil
-	}
-}
-
-// Close tears the tunnel down.
-func (t *Tunnel) Close() error {
-	if t.cancel != nil {
-		t.cancel()
-	}
-	if t.stream != nil {
-		t.stream.CancelRead(0)
-		t.stream.CancelWrite(0)
-	}
-	if t.client != nil {
-		_ = t.client.CloseWithError(0, "closed")
-	}
-	if t.conn != nil {
-		_ = t.conn.CloseWithError(0, "closed")
-	}
-	if t.transport != nil {
-		_ = t.transport.Close()
-	}
-	if t.qTransport != nil {
-		_ = t.qTransport.Close()
-	}
-	if t.udpConn != nil {
-		_ = t.udpConn.Close()
-	}
-	return nil
+	return &Tunnel{
+		send: func(packet []byte) error {
+			buf := quicvarint.Append(nil, 0) // context id 0: full packet
+			buf = append(buf, packet...)
+			return stream.SendDatagram(buf)
+		},
+		recv: func(rctx context.Context) ([]byte, error) {
+			for {
+				b, err := stream.ReceiveDatagram(rctx)
+				if err != nil {
+					return nil, err
+				}
+				ctxID, n, err := quicvarint.Parse(b)
+				if err != nil || ctxID != 0 {
+					continue
+				}
+				return b[n:], nil
+			}
+		},
+		closer: func() error {
+			cancel()
+			stream.CancelRead(0)
+			stream.CancelWrite(0)
+			_ = client.CloseWithError(0, "closed")
+			_ = conn.CloseWithError(0, "closed")
+			_ = transport.Close()
+			_ = qTransport.Close()
+			_ = udpConn.Close()
+			return nil
+		},
+		status: resp.StatusCode,
+	}, nil
 }
 
 // selfSignedCert builds the short-lived self-signed certificate that wraps
