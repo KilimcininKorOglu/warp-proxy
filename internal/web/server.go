@@ -257,6 +257,7 @@ func applyForm(cfg *config.Config, r *http.Request) {
 	cfg.Bridge.MinInterval = formOr(r, "bridge_min_interval", cfg.Bridge.MinInterval)
 	cfg.Bridge.Timeout = formOr(r, "bridge_timeout", cfg.Bridge.Timeout)
 	cfg.Bridge.InjectSession = r.FormValue("bridge_inject_session") == "on"
+	cfg.Bridge.RotateSessionOnRetry = r.FormValue("bridge_rotate_session") == "on"
 }
 
 // parseInts parses a comma-separated integer list; an empty or invalid

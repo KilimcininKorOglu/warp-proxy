@@ -39,36 +39,66 @@ const (
 type identity struct {
 	session string
 	request string
+	// force makes apply overwrite client-provided ids; set by rotate after
+	// a WARP rotation when Bridge.RotateSessionOnRetry is on.
+	force bool
 }
 
 // newIdentity builds the identity for one client request when injection is
-// enabled, or nil when it is off. The ids are generated once so a replayed
-// attempt keeps the same session.
+// enabled, or nil when it is off.
 func newIdentity(cfg config.BridgeConfig) *identity {
 	if !cfg.InjectSession {
 		return nil
 	}
-	return &identity{
-		session: sessionPrefix + randomString(digitChars, sessionDigits),
-		request: requestPrefix + randomString(alnumChars, requestLength),
-	}
+	session, request := newIDs()
+	return &identity{session: session, request: request}
 }
 
-// apply adds the headers the client did not already send. An empty or
-// non-opencode User-Agent is replaced with the opencode one.
+// renderInjection applies the free-tier identity to a request: it returns the
+// body with tool stubs merged in and the identity to apply to every attempt,
+// or a nil identity when injection is off.
+func renderInjection(cfg config.BridgeConfig, body []byte) ([]byte, *identity) {
+	ids := newIdentity(cfg)
+	if ids == nil {
+		return body, nil
+	}
+	return ensureTools(body), ids
+}
+
+// rotate regenerates the ids and forces them onto the next attempt. It
+// overrides even a client-provided session, so a request replayed after a
+// WARP rotation carries a fresh OpenCode identity.
+func (id *identity) rotate() {
+	if id == nil {
+		return
+	}
+	id.session, id.request = newIDs()
+	id.force = true
+}
+
+// apply adds the headers the client did not already send, or replaces them
+// when the identity was rotated. An empty or non-opencode User-Agent is
+// replaced with the opencode one.
 func (id *identity) apply(h http.Header) {
 	if id == nil {
 		return
 	}
-	if h.Get("X-Opencode-Session") == "" {
+	if id.force || h.Get("X-Opencode-Session") == "" {
 		h.Set("X-Opencode-Session", id.session)
 	}
-	if h.Get("X-Opencode-Request") == "" {
+	if id.force || h.Get("X-Opencode-Request") == "" {
 		h.Set("X-Opencode-Request", id.request)
 	}
 	if ua := h.Get("User-Agent"); !strings.HasPrefix(strings.ToLower(ua), "opencode/") {
 		h.Set("User-Agent", opencodeUA)
 	}
+}
+
+// newIDs returns a fresh session id ("ses_" + 26 digits) and request id
+// ("msg_" + 24 alphanumeric characters).
+func newIDs() (session, request string) {
+	return sessionPrefix + randomString(digitChars, sessionDigits),
+		requestPrefix + randomString(alnumChars, requestLength)
 }
 
 // randomString returns n random characters drawn from alphabet.

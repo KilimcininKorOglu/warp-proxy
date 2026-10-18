@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"sync/atomic"
 	"testing"
 
 	"warp-proxy/internal/config"
@@ -175,7 +176,7 @@ func TestBridgeInjectsIdentity(t *testing.T) {
 		body, _ := io.ReadAll(r.Body)
 		gotNames = toolNames(t, body)
 		io.WriteString(w, `{}`)
-	}, rotate, true, 0)
+	}, rotate, true, 0, false)
 
 	req, _ := http.NewRequest("POST", bridge.URL+"/v1/chat/completions",
 		bytes.NewBufferString(`{"model":"x","messages":[{"role":"user","content":"hi"}]}`))
@@ -198,5 +199,78 @@ func TestBridgeInjectsIdentity(t *testing.T) {
 	}
 	if len(gotNames) != 2 || gotNames[0] != "bash" || gotNames[1] != "read" {
 		t.Errorf("tools = %v, want [bash read]", gotNames)
+	}
+}
+
+// retryOnceHandler answers the first call with a FreeUsageLimitError 429 and
+// records the session/request ids seen on both attempts.
+func retryOnceHandler(calls *atomic.Int32, first, replay *[2]string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ids := [2]string{r.Header.Get("X-Opencode-Session"), r.Header.Get("X-Opencode-Request")}
+		if calls.Add(1) == 1 {
+			*first = ids
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(429)
+			io.WriteString(w, `{"error":{"type":"FreeUsageLimitError"}}`)
+			return
+		}
+		*replay = ids
+		io.WriteString(w, `{}`)
+	}
+}
+
+func TestRotateSessionOnRetryRefreshesIDs(t *testing.T) {
+	var calls atomic.Int32
+	var first, replay [2]string
+	rotate := func(context.Context) error { return nil }
+	bridge := startBridge(t, retryOnceHandler(&calls, &first, &replay), rotate, true, 1, true)
+
+	const clientSession = "ses_11111111111111111111111111"
+	const clientRequest = "msg_ClientProvidedRequest0001"
+	req, _ := http.NewRequest("POST", bridge.URL+"/v1/chat/completions",
+		bytes.NewBufferString(`{"messages":[]}`))
+	req.Header.Set("X-Opencode-Session", clientSession)
+	req.Header.Set("X-Opencode-Request", clientRequest)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	resp.Body.Close()
+
+	if first[0] != clientSession || first[1] != clientRequest {
+		t.Errorf("first attempt ids = %v, want the client values", first)
+	}
+	if replay[0] == clientSession {
+		t.Error("replay kept the client session despite rotate_session_on_retry")
+	}
+	if replay[1] == clientRequest {
+		t.Error("replay kept the client request id despite rotate_session_on_retry")
+	}
+	if !sessionIDPattern.MatchString(replay[0]) {
+		t.Errorf("replay session = %q", replay[0])
+	}
+	if !requestIDPattern.MatchString(replay[1]) {
+		t.Errorf("replay request = %q", replay[1])
+	}
+}
+
+func TestRotateSessionOffKeepsClientIDs(t *testing.T) {
+	var calls atomic.Int32
+	var first, replay [2]string
+	rotate := func(context.Context) error { return nil }
+	bridge := startBridge(t, retryOnceHandler(&calls, &first, &replay), rotate, true, 1, false)
+
+	const clientSession = "ses_22222222222222222222222222"
+	req, _ := http.NewRequest("POST", bridge.URL+"/v1/chat/completions",
+		bytes.NewBufferString(`{"messages":[]}`))
+	req.Header.Set("X-Opencode-Session", clientSession)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	resp.Body.Close()
+
+	if replay[0] != clientSession {
+		t.Errorf("replay session = %q, want the client value preserved", replay[0])
 	}
 }

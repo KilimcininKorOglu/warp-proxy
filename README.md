@@ -52,7 +52,8 @@ browser --> :8590 panel
   free-tier identity (`bridge.inject_session`, on by default): the bridge
   adds the `X-Opencode-Session` and `X-Opencode-Request` headers, an
   opencode `User-Agent` and stub tool entries when the client did not
-  provide them. Values the client sends are never overwritten.
+  provide them. Client values are kept on the first attempt; after a WARP
+  rotation the ids are refreshed (`bridge.rotate_session_on_retry`).
 
 ## Using the AI bridge with opencode
 
@@ -93,9 +94,13 @@ carry them:
 - stub entries in the `tools` array of chat bodies (the free gateway
   requires at least two)
 
-Values sent by the client are respected and never overwritten; the ids are
-generated once per request so a replay keeps the same session. Toggle the
-whole feature off with `inject_session: false` in the config or the panel.
+Values sent by the client are respected and never overwritten on the first
+attempt. When a retryable status rotates the WARP IP, the bridge can also
+refresh the session and request ids so the replay carries a fresh identity
+(`rotate_session_on_retry`, on by default): this overrides even a
+client-provided session, trading the replayed request's prompt-cache affinity
+for a new session bucket. Toggle the whole feature off with
+`inject_session: false` in the config or the panel.
 
 ## Run
 

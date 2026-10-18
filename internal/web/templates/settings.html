@@ -44,6 +44,9 @@
     <tr><th>Free-tier enjeksiyonu</th>
       <td><label><input type="checkbox" name="bridge_inject_session" {{if .Cfg.Bridge.InjectSession}}checked{{end}} style="width:auto"> açık</label>
       <div class="muted">Her upstream isteğine X-Opencode-Session, X-Opencode-Request, opencode User-Agent ve eksik tool stub'larını ekler. İstemcinin gönderdiği değerler korunur.</div></td></tr>
+    <tr><th>429'da kimlik yenile</th>
+      <td><label><input type="checkbox" name="bridge_rotate_session" {{if .Cfg.Bridge.RotateSessionOnRetry}}checked{{end}} style="width:auto"> açık</label>
+      <div class="muted">WARP IP'si çevrilirken session/request ID'lerini de yeniler (istemci gönderse bile). Retry edilen istek için prompt-cache affinity'sini feda eder.</div></td></tr>
     <tr><th>Bridge portu</th><td><input type="text" name="bridge_listen" value="{{.Cfg.Bridge.Listen}}"></td></tr>
     <tr><th>Bridge upstream</th><td><input type="text" name="bridge_upstream" value="{{.Cfg.Bridge.Upstream}}"></td></tr>
     <tr><th>Retry statusleri</th><td><input type="text" name="bridge_retry_statuses" value="{{range $i, $s := .Cfg.Bridge.RetryStatuses}}{{if $i}},{{end}}{{$s}}{{end}}">

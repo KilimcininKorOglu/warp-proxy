@@ -59,9 +59,11 @@ func TestRetryable(t *testing.T) {
 
 // startBridge wires a bridge Server to a scripted upstream through the SOCKS5
 // fake (the warp-cli stand-in) and returns the client-facing bridge server.
-// inject toggles free-tier session injection; retryAttempts bounds replays.
+// inject toggles free-tier session injection, retryAttempts bounds replays,
+// rotateSessionOnRetry refreshes the injected ids after a WARP rotation.
 func startBridge(t *testing.T, upstreamHandler http.HandlerFunc,
-	rotate func(context.Context) error, inject bool, retryAttempts int) *httptest.Server {
+	rotate func(context.Context) error, inject bool, retryAttempts int,
+	rotateSessionOnRetry bool) *httptest.Server {
 	t.Helper()
 
 	socksLn := fakeSocks(t)
@@ -70,14 +72,15 @@ func startBridge(t *testing.T, upstreamHandler http.HandlerFunc,
 
 	cfg := func() config.BridgeConfig {
 		return config.BridgeConfig{
-			Enabled:       true,
-			Upstream:      upstream.URL,
-			RetryStatuses: []int{429},
-			RetryAttempts: retryAttempts,
-			MaxConcurrent: 3,
-			MinInterval:   "0s",
-			Timeout:       "10s",
-			InjectSession: inject,
+			Enabled:              true,
+			Upstream:             upstream.URL,
+			RetryStatuses:        []int{429},
+			RetryAttempts:        retryAttempts,
+			MaxConcurrent:        3,
+			MinInterval:          "0s",
+			Timeout:              "10s",
+			InjectSession:        inject,
+			RotateSessionOnRetry: rotateSessionOnRetry,
 		}
 	}
 	srv := New(&proxy.Upstream{Addr: socksLn, Timeout: 5 * time.Second},
@@ -96,7 +99,7 @@ func fixture(t *testing.T, upstreamHandler http.HandlerFunc, rotations *atomic.I
 		rotations.Add(1)
 		return nil
 	}
-	return startBridge(t, upstreamHandler, rotate, false, 1)
+	return startBridge(t, upstreamHandler, rotate, false, 1, false)
 }
 
 func TestForwardsAndPreservesHeaders(t *testing.T) {

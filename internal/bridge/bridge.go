@@ -10,6 +10,7 @@ package bridge
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -69,12 +70,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Add the free-tier tool stubs before the request is (possibly) replayed,
-	// so every attempt carries the same body.
-	if cfg.InjectSession {
-		body = ensureTools(body)
-	}
-	ids := newIdentity(cfg)
+	// Add the free-tier tool stubs and identity before the request is
+	// (possibly) replayed, so every attempt carries the same body.
+	body, ids := renderInjection(cfg, body)
 
 	if err := s.acquire(r.Context(), cfg); err != nil {
 		http.Error(w, "bridge busy: "+err.Error(), http.StatusServiceUnavailable)
@@ -96,19 +94,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.note("warn", "upstream %d on %s, rotating WARP for replay",
 			resp.StatusCode, r.URL.Path)
 
-		// Honor Retry-After when present, then rotate and replay.
-		if wait := retryAfter(resp, time.Now()); wait > 0 {
-			select {
-			case <-r.Context().Done():
-				resp.Body.Close()
+		if err := s.prepareReplay(r.Context(), resp, cfg, ids); err != nil {
+			if errors.Is(err, errClientCanceled) {
 				http.Error(w, "client canceled while waiting for retry", http.StatusBadGateway)
 				return
-			case <-time.After(wait):
 			}
-		}
-		resp.Body.Close()
-		if err := s.Rotate(r.Context()); err != nil {
-			s.note("warn", "rotation before replay failed: %v", err)
 			break
 		}
 	}
@@ -119,6 +109,37 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 	copyResponse(w, resp)
 	s.note("info", "%s %s -> %d", r.Method, r.URL.Path, resp.StatusCode)
+}
+
+// errClientCanceled reports that the client went away while the bridge waited
+// out a Retry-After before replaying.
+var errClientCanceled = errors.New("client canceled while waiting for retry")
+
+// prepareReplay honors Retry-After on resp, rotates the WARP exit IP and
+// refreshes the OpenCode identity for the replay when configured. It returns
+// errClientCanceled if the client canceled, or the rotation error; any other
+// non-nil error means the replay must not happen.
+func (s *Server) prepareReplay(ctx context.Context, resp *http.Response,
+	cfg config.BridgeConfig, ids *identity) error {
+	if wait := retryAfter(resp, time.Now()); wait > 0 {
+		select {
+		case <-ctx.Done():
+			resp.Body.Close()
+			return errClientCanceled
+		case <-time.After(wait):
+		}
+	}
+	resp.Body.Close()
+	if err := s.Rotate(ctx); err != nil {
+		s.note("warn", "rotation before replay failed: %v", err)
+		return err
+	}
+	// A rotation can also refresh the OpenCode identity so the replay is not
+	// tied to the previous session (see Bridge.RotateSessionOnRetry).
+	if cfg.InjectSession && cfg.RotateSessionOnRetry {
+		ids.rotate()
+	}
+	return nil
 }
 
 // roundTrip forwards the buffered request to the upstream once.

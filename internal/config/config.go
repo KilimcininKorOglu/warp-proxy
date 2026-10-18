@@ -43,6 +43,11 @@ type BridgeConfig struct {
 	// X-Opencode-Request headers, an opencode User-Agent, and stub tool
 	// entries. Values sent by the client are respected.
 	InjectSession bool `yaml:"inject_session"`
+	// RotateSessionOnRetry refreshes the OpenCode session and request ids
+	// after a WARP rotation, overriding values the client sent, so a
+	// replayed request carries a fresh identity. It trades prompt-cache
+	// affinity on the replayed request for a new session bucket.
+	RotateSessionOnRetry bool `yaml:"rotate_session_on_retry"`
 }
 
 // TimeoutDur parses the configured upstream timeout.
@@ -173,15 +178,16 @@ func Defaults() *Config {
 			ResolveCacheTTL: "10m",
 		},
 		Bridge: BridgeConfig{
-			Enabled:       true,
-			Listen:        ":8593",
-			Upstream:      "https://opencode.ai/zen",
-			RetryStatuses: []int{429},
-			RetryAttempts: 1,
-			MaxConcurrent: 3,
-			MinInterval:   "0.5s",
-			Timeout:       "120s",
-			InjectSession: true,
+			Enabled:              true,
+			Listen:               ":8593",
+			Upstream:             "https://opencode.ai/zen",
+			RetryStatuses:        []int{429},
+			RetryAttempts:        1,
+			MaxConcurrent:        3,
+			MinInterval:          "0.5s",
+			Timeout:              "120s",
+			InjectSession:        true,
+			RotateSessionOnRetry: true,
 		},
 		Auth: AuthConfig{Username: "admin"},
 	}

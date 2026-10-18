@@ -67,6 +67,10 @@ bridge:
   # opencode User-Agent and stub tool entries to upstream requests that do
   # not already carry them. Values sent by the client are respected.
   inject_session: true
+  # On a 429 rotation, also refresh the session/request ids (even if the
+  # client sent them) so the replay carries a fresh identity. Costs the
+  # replayed request its prompt-cache affinity.
+  rotate_session_on_retry: true
 
 # Panel login. The password is written on first start from the
 # WARP_PROXY_PASSWORD environment variable; only the bcrypt hash is stored.
