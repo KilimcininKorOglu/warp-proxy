@@ -28,10 +28,10 @@ const capsuleConnectIPData = 0x00
 // round trip.
 const h2ConnectTimeout = 15 * time.Second
 
-// h2Debug logs frame traffic when MASQUE_DEBUG=1.
+// h2Debug logs tunnel traffic when MASQUE_DEBUG=1.
 func h2Debug(format string, args ...any) {
 	if os.Getenv("MASQUE_DEBUG") == "1" {
-		log.Printf("h2: "+format, args...)
+		log.Printf("masque: "+format, args...)
 	}
 }
 

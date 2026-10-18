@@ -59,11 +59,16 @@ func run(ctx context.Context, stateDir, endpoint string, force bool) error {
 		return fmt.Errorf("dns through tunnel: %w", err)
 	}
 	fmt.Printf("whoami.cloudflare TXT: %s\n", answer)
-	if strings.Contains(answer, "ip=") {
-		fmt.Println("PROOF: tunnel egress is a WARP address")
+	// The TXT carries either "ip=<addr>" or the bare address.
+	egress := answer
+	if i := strings.Index(answer, "ip="); i >= 0 {
+		egress = answer[i+3:]
+	}
+	if ip := net.ParseIP(strings.TrimSpace(egress)); ip != nil {
+		fmt.Printf("PROOF: tunnel egress is %s (a WARP address)\n", ip)
 		return nil
 	}
-	return fmt.Errorf("answer %q carries no ip= field", answer)
+	return fmt.Errorf("answer %q carries no usable egress address", answer)
 }
 
 func loadOrRegister(ctx context.Context, dir string, force bool) (*masque.Identity, error) {
@@ -185,7 +190,7 @@ func buildDNSQuery(name string) []byte {
 	}
 	b.WriteByte(0)
 	binary.Write(&b, binary.BigEndian, uint16(16)) // TXT
-	binary.Write(&b, binary.BigEndian, uint16(1))  // IN
+	binary.Write(&b, binary.BigEndian, uint16(3))  // CHAOS: whoami.cloudflare answers in CH class
 	return b.Bytes()
 }
 

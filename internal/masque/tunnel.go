@@ -220,8 +220,10 @@ func dialH3(ctx context.Context, id *Identity, conf *tls.Config,
 				if err != nil {
 					return nil, err
 				}
+				h2Debug("recv datagram: %d bytes %x", len(b), b[:min(len(b), 48)])
 				ctxID, n, err := quicvarint.Parse(b)
 				if err != nil || ctxID != 0 {
+					h2Debug("skip datagram: ctx parse err=%v", err)
 					continue
 				}
 				return b[n:], nil
