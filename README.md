@@ -1,8 +1,8 @@
 # warp-proxy
 
 warp-proxy routes all client traffic through Cloudflare WARP. It manages the
-official `warp-cli` client in proxy mode and exposes two proxy listeners plus
-a Turkish admin web panel.
+official `warp-cli` client in proxy mode and exposes HTTP and SOCKS5 proxy
+listeners, an OpenAI-compatible AI bridge and a Turkish admin web panel.
 
 YouTube and many other services block most VPS and cloud IP addresses. A
 WARP tunnel gives the machine a Cloudflare exit address instead. When the
@@ -19,7 +19,8 @@ or `config.yaml`.
 ```
 client --> :8591 HTTP proxy  --\
 client --> :8592 SOCKS5        +--> warp-cli proxy 127.0.0.1:40000 --> WARP
-browser --> :8590 panel       --/
+AI tool --> :8593 bridge      --/
+browser --> :8590 panel
 ```
 
 - `internal/warp` drives `warp-cli` (registration, `mode proxy`,
@@ -43,6 +44,37 @@ browser --> :8590 panel       --/
   ranges; decisions are cached per host. TLS SNI is untouched, so only
   Cloudflare-fronted sites are rewritten and the pool stays empty until a
   Clean-IP scan has run.
+- `internal/bridge` is the AI bridge: an OpenAI-compatible reverse proxy on
+  :8593 that forwards requests to the configured upstream through WARP.
+  When the upstream answers with a retryable status (429 by default), it
+  rotates the WARP exit IP and replays the request once, honoring
+  `Retry-After`. Requests are forwarded unchanged; the bridge adds no
+  headers.
+
+## Using the AI bridge with opencode
+
+Point the free `opencode` provider at the bridge by merging one key into
+`~/.config/opencode/opencode.json`:
+
+```json
+{
+  "provider": {
+    "opencode": {
+      "options": {
+        "baseURL": "http://HOST:8593/v1"
+      }
+    }
+  }
+}
+```
+
+`HOST` is the machine running warp-proxy. The bridge forwards everything to
+`bridge.upstream` (`https://opencode.ai/zen` by default) through WARP; when
+the free tier rate-limits the exit IP with a 429, the bridge rotates WARP
+and replays automatically (rate-limited, `bridge.retry_attempts`). Any
+OpenAI-compatible client works the same way: set its base URL to
+`http://HOST:8593/v1`. The upstream, retry statuses and limits are editable
+in the panel's settings page.
 
 ## Run
 
