@@ -13,6 +13,7 @@ services:
       - "8590:8590" # web panel
       - "8591:8591" # HTTP proxy
       - "8592:8592" # SOCKS5 proxy
+      - "8593:8593" # AI bridge (OpenAI-compatible, rotate-on-429)
     volumes:
       - warp-registration:/var/lib/cloudflare-warp
       # Directory mount, not a single file: the app saves its config
