@@ -26,6 +26,9 @@ type endpointConn struct {
 	ep tcpip.Endpoint
 	wq *waiter.Queue
 
+	local  *net.TCPAddr
+	remote *net.TCPAddr
+
 	mu            sync.Mutex
 	readDeadline  time.Time
 	writeDeadline time.Time
@@ -134,17 +137,11 @@ func (c *endpointConn) Close() error {
 	return nil
 }
 
-// LocalAddr implements net.Conn; the tunnel's local address is not exposed.
-func (c *endpointConn) LocalAddr() net.Addr { return tunnelAddr{} }
+// LocalAddr implements net.Conn: the tunnel-assigned address.
+func (c *endpointConn) LocalAddr() net.Addr { return c.local }
 
-// RemoteAddr implements net.Conn; the tunnel's remote address is not exposed.
-func (c *endpointConn) RemoteAddr() net.Addr { return tunnelAddr{} }
-
-// tunnelAddr is a placeholder address for tunnel connections.
-type tunnelAddr struct{}
-
-func (tunnelAddr) Network() string { return "masque" }
-func (tunnelAddr) String() string  { return "masque-tunnel" }
+// RemoteAddr implements net.Conn: the dialed target.
+func (c *endpointConn) RemoteAddr() net.Addr { return c.remote }
 
 // SetDeadline implements net.Conn.
 func (c *endpointConn) SetDeadline(t time.Time) error {

@@ -193,7 +193,12 @@ func (d *NetstackDialer) dialTCP(ctx context.Context, ip net.IP, port int) (net.
 		ep.Close()
 		return nil, err
 	}
-	return &endpointConn{ep: ep, wq: &wq}, nil
+	return &endpointConn{
+		ep:     ep,
+		wq:     &wq,
+		local:  &net.TCPAddr{IP: d.ipv4},
+		remote: &net.TCPAddr{IP: ip, Port: port},
+	}, nil
 }
 
 // isConnectStarted reports whether err is the async connect marker.
