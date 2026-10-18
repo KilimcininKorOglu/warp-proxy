@@ -124,6 +124,42 @@ func fixture(t *testing.T, upstreamHandler http.HandlerFunc, rotations *atomic.I
 	return startBridge(t, upstreamHandler, rotate, false, 1, false)
 }
 
+// TestHealthNotProxied verifies the local /health path answers without
+// reaching the upstream, so probes spend no quota.
+func TestHealthNotProxied(t *testing.T) {
+	var upstreamHits atomic.Int32
+	bridge := fixture(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		io.WriteString(w, `{"ok":true}`)
+	}, &atomic.Int32{})
+
+	resp, err := http.Get(bridge.URL + "/health")
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "ok\n" {
+		t.Errorf("body = %q, want %q", body, "ok\n")
+	}
+	if n := upstreamHits.Load(); n != 0 {
+		t.Errorf("upstream hit %d times, want 0", n)
+	}
+
+	// A path that merely contains the prefix must still be proxied.
+	resp2, err := http.Get(bridge.URL + "/health/check")
+	if err != nil {
+		t.Fatalf("GET /health/check: %v", err)
+	}
+	defer resp2.Body.Close()
+	if n := upstreamHits.Load(); n != 1 {
+		t.Errorf("upstream hits = %d, want 1 for /health/check", n)
+	}
+}
+
 func TestForwardsAndPreservesHeaders(t *testing.T) {
 	var gotPath, gotAuth, gotCT string
 	bridge := fixture(t, func(w http.ResponseWriter, r *http.Request) {

@@ -67,7 +67,25 @@ func New(upstream *proxy.Upstream, logs *logbuf.Buffer, logger *slog.Logger,
 }
 
 // ServeHTTP implements the bridge handler.
+// serveHealth answers the local /health path with 200 ok and reports whether
+// it did, so the request never reaches the upstream or spends its quota.
+func serveHealth(w http.ResponseWriter, r *http.Request) bool {
+	if r.URL.Path != "/health" {
+		return false
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok\n"))
+	return true
+}
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// The local health path is answered here and never proxied, so a
+	// health probe does not spend upstream quota.
+	if serveHealth(w, r) {
+		return
+	}
+
 	cfg := s.Cfg()
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
@@ -90,25 +108,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.release()
 
-	attempts := max(cfg.RetryAttempts, 0)
-	var resp *http.Response
-	var replayErr error
-	for attempt := 0; attempt <= attempts; attempt++ {
-		resp, replayErr = s.roundTrip(r, body, cfg, ids)
-		if replayErr != nil {
-			break
-		}
-		if !retryable(cfg, resp.StatusCode) || attempt == attempts {
-			break
-		}
-
-		if err := s.prepareReplay(r, resp, cfg, ids); err != nil {
-			if errors.Is(err, errClientCanceled) {
-				http.Error(w, "client canceled while waiting for retry", http.StatusBadGateway)
-				return
-			}
-			break
-		}
+	resp, replayErr := s.replay(r, body, cfg, ids)
+	if errors.Is(replayErr, errClientCanceled) {
+		http.Error(w, "client canceled while waiting for retry", http.StatusBadGateway)
+		return
 	}
 	if replayErr != nil {
 		http.Error(w, "bridge upstream failed: "+replayErr.Error(), http.StatusBadGateway)
@@ -117,6 +120,24 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 	copyResponse(w, resp)
 	s.note("info", "%s %s -> %d", r.Method, r.URL.Path, resp.StatusCode)
+}
+
+// replay runs the request against the upstream, retrying up to
+// cfg.RetryAttempts times: each retryable answer goes through prepareReplay
+// (WARP rotation or Retry-After wait) before the next attempt. The final
+// response or error is returned; errClientCanceled propagates unchanged.
+func (s *Server) replay(r *http.Request, body []byte,
+	cfg config.BridgeConfig, ids *identity) (*http.Response, error) {
+	attempts := max(cfg.RetryAttempts, 0)
+	for attempt := 0; ; attempt++ {
+		resp, err := s.roundTrip(r, body, cfg, ids)
+		if err != nil || !retryable(cfg, resp.StatusCode) || attempt == attempts {
+			return resp, err
+		}
+		if err := s.prepareReplay(r, resp, cfg, ids); err != nil {
+			return nil, err
+		}
+	}
 }
 
 // errClientCanceled reports that the client went away while the bridge waited
