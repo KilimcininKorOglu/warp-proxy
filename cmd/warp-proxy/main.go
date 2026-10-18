@@ -14,12 +14,14 @@ import (
 	"syscall"
 	"time"
 
+	"warp-proxy/internal/cleanip"
 	"warp-proxy/internal/config"
+	"warp-proxy/internal/front"
 	"warp-proxy/internal/health"
 	"warp-proxy/internal/logbuf"
 	"warp-proxy/internal/proxy"
-	"warp-proxy/internal/web"
 	"warp-proxy/internal/warp"
+	"warp-proxy/internal/web"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -47,6 +49,25 @@ func main() {
 	manager := warp.NewManager(cfg.Warp.Binary, cfg.Warp.CLIArgs, cfg.Warp.ReconnectMode)
 	upstream := &proxy.Upstream{Addr: cfg.Warp.ProxyAddr}
 
+	// Front rewriting: pool fed by the Clean-IP scan, decisions read the
+	// live config on every request.
+	selector := front.NewSelector(func() front.Config {
+		ttl, err := config.ParseDuration(cfg.Front.ResolveCacheTTL)
+		if err != nil {
+			ttl = 10 * time.Minute
+		}
+		return front.Config{
+			Enabled:         cfg.Front.Enabled,
+			Domains:         cfg.Front.Domains,
+			ResolveCacheTTL: ttl,
+		}
+	})
+	upstream.Front = selector.Pick
+
+	// The health checker must see the tunnel as clients experience WARP,
+	// never a front-rewritten edge, so it gets its own plain upstream.
+	checkerUpstream := &proxy.Upstream{Addr: cfg.Warp.ProxyAddr}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -55,12 +76,18 @@ func main() {
 		logs.Add("error", "warp", "warp setup failed: %v", err)
 	}
 
-	checker := health.NewChecker(upstream, manager, logs, logger, func() health.Config {
+	checker := health.NewChecker(checkerUpstream, manager, logs, logger, func() health.Config {
 		return currentHealthConfig(cfg)
 	})
 	applyLimiter(cfg, checker)
 
-	go checker.Loop(ctx, healthInterval(cfg))
+	// Check once at startup so the panel shows real state immediately,
+	// then keep the periodic loop.
+	go func() {
+		waitUpstream(ctx, checkerUpstream.Addr, 30*time.Second)
+		checker.RunOnce(ctx)
+		checker.Loop(ctx, healthInterval(cfg))
+	}()
 
 	httpSrv := &proxy.HTTPServer{Upstream: upstream, Log: logger, OnRequest: logSink.request}
 	socksSrv := &proxy.SOCKSServer{Upstream: upstream}
@@ -75,10 +102,17 @@ func main() {
 	panel.Logger = logger
 	panel.OnLiveConfigChange = func(c *config.Config) {
 		upstream.Addr = c.Warp.ProxyAddr
+		checkerUpstream.Addr = c.Warp.ProxyAddr
 		manager.SetMode(c.Warp.ReconnectMode)
 		applyLimiter(c, checker)
 	}
-	panel.Scanner = web.RunScan
+	panel.Scanner = func(ctx context.Context, c *config.Config) ([]cleanip.Result, error) {
+		results, err := web.RunScan(ctx, c)
+		if err == nil {
+			selector.SetPool(results)
+		}
+		return results, err
+	}
 	panel.EndpointApplier = func(ctx context.Context, endpoint string) error {
 		if dec := checker.AllowReconnect(); !dec.Allowed {
 			return fmt.Errorf("rate limited: %s", dec)
@@ -182,6 +216,28 @@ func healthInterval(cfg *config.Config) time.Duration {
 		return 5 * time.Minute
 	}
 	return d
+}
+
+// waitUpstream blocks until the upstream proxy accepts TCP connections or
+// the budget runs out, so the first health check does not race warp-cli's
+// listener startup.
+func waitUpstream(ctx context.Context, addr string, budget time.Duration) {
+	deadline := time.Now().Add(budget)
+	for {
+		conn, err := net.DialTimeout("tcp", addr, time.Second)
+		if err == nil {
+			conn.Close()
+			return
+		}
+		if ctx.Err() != nil || time.Now().After(deadline) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
+	}
 }
 
 // logSink adapts proxy requests into the panel ring buffer.
