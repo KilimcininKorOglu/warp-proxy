@@ -2,6 +2,8 @@ package health
 
 import (
 	"context"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,6 +11,7 @@ import (
 	"time"
 
 	"warp-proxy/internal/logbuf"
+	"warp-proxy/internal/masque"
 	"warp-proxy/internal/proxy"
 	"warp-proxy/internal/warp"
 )
@@ -70,8 +73,25 @@ func TestParseTrace(t *testing.T) {
 	}
 }
 
-// checkerFixture wires a Checker to a scripted health target and a mock
-// warp-cli binary.
+// noopTunnel and noopDialer stand in for the live tunnel pieces.
+type noopTunnel struct{}
+
+func (noopTunnel) Close() error { return nil }
+
+type noopDialer struct{}
+
+func (noopDialer) Dial(context.Context, string, string) (net.Conn, error) {
+	return nil, errors.New("no tunnel in this test")
+}
+
+// plainDial dials directly from the host, standing in for the tunnel.
+func plainDial(ctx context.Context, network, addr string) (net.Conn, error) {
+	var d net.Dialer
+	return d.DialContext(ctx, network, addr)
+}
+
+// checkerFixture wires a Checker to a scripted health target and a manager
+// without a live tunnel (the reconnect hook is what the tests observe).
 type checkerFixture struct {
 	checker *Checker
 	health  *httptest.Server
@@ -82,15 +102,6 @@ func newFixture(t *testing.T, healthBody string) *checkerFixture {
 	t.Helper()
 
 	reconns := 0
-	dir := t.TempDir()
-	script := dir + "/warp-cli"
-	body := "#!/bin/sh\n" +
-		"echo \"$@\" >> " + dir + "/calls\n" +
-		"if [ \"$1\" = \"disconnect\" ] || [ \"$1\" = \"connect\" ]; then echo reconns >> " + dir + "/calls; fi\n" +
-		"exit 0\n"
-	if err := writeFile(script, body); err != nil {
-		t.Fatalf("write mock: %v", err)
-	}
 
 	health := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/trace") {
@@ -101,7 +112,15 @@ func newFixture(t *testing.T, healthBody string) *checkerFixture {
 	}))
 	t.Cleanup(health.Close)
 
-	mgr := warp.NewManager(script, nil, warp.ModeReconnect)
+	mgr := warp.NewManager(t.TempDir(), warp.ModeReconnect)
+	mgr.SetHooks(
+		func(context.Context) (*masque.Identity, error) {
+			return &masque.Identity{ID: "test", IPv4: "172.16.0.2/32"}, nil
+		},
+		func(context.Context, *masque.Identity, string) (warp.Tunnel, warp.Dialer, error) {
+			return noopTunnel{}, noopDialer{}, nil
+		},
+	)
 	logs := logbuf.New(64)
 	cfg := func() Config {
 		return Config{
@@ -112,7 +131,7 @@ func newFixture(t *testing.T, healthBody string) *checkerFixture {
 			BotMarkers: []string{"Sign in to confirm you're not a bot"},
 		}
 	}
-	c := NewChecker(&proxy.Upstream{Addr: fakeUpstream(t)}, mgr, logs, discardLogger(), cfg)
+	c := NewChecker(&proxy.Upstream{DialFunc: plainDial}, mgr, logs, discardLogger(), cfg)
 	return &checkerFixture{checker: c, health: health, reconns: &reconns}
 }
 

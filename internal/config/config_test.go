@@ -15,8 +15,8 @@ func TestLoadMissingFileYieldsDefaults(t *testing.T) {
 	if cfg.HTTPProxy.Listen != def.HTTPProxy.Listen {
 		t.Errorf("http listen = %q, want %q", cfg.HTTPProxy.Listen, def.HTTPProxy.Listen)
 	}
-	if cfg.Warp.ProxyAddr != def.Warp.ProxyAddr {
-		t.Errorf("warp proxy addr = %q, want %q", cfg.Warp.ProxyAddr, def.Warp.ProxyAddr)
+	if cfg.Warp.StateDir != def.Warp.StateDir {
+		t.Errorf("warp state dir = %q, want %q", cfg.Warp.StateDir, def.Warp.StateDir)
 	}
 }
 

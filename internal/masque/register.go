@@ -285,6 +285,36 @@ func resolveViaDoH(ctx context.Context, host string) ([]string, error) {
 	return out, nil
 }
 
+// Delete removes the device registration from Cloudflare's API. A missing
+// registration (404/403) counts as success: the goal is only that the old
+// identity stops existing.
+func (c *Client) Delete(ctx context.Context, id *Identity) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete,
+		strings.TrimRight(c.baseURL, "/")+"/"+APIVersion+"/reg/"+id.ID, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", APIUserAgent)
+	req.Header.Set("CF-Client-Version", APIClientVersion)
+	req.Header.Set("Authorization", "Bearer "+id.AccessToken)
+	if c.pinAddr != "" {
+		req.Host = req.URL.Host
+		req.URL.Host = net.JoinHostPort(c.pinAddr, "443")
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusForbidden {
+		return nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return fmt.Errorf("warp api delete: %d", resp.StatusCode)
+	}
+	return nil
+}
+
 // RegisterAuto registers through the direct client and falls back to the DoH
 // bypass when the direct attempt fails (e.g. poisoned DNS).
 func RegisterAuto(ctx context.Context, opts Options) (*Identity, error) {

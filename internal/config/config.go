@@ -99,17 +99,11 @@ type ListenerConfig struct {
 	Listen string `yaml:"listen"`
 }
 
-// WarpConfig describes how to drive the warp-cli binary and where its
-// local proxy listens.
+// WarpConfig describes the built-in MASQUE tunnel.
 type WarpConfig struct {
-	// Binary is the warp-cli executable path or name.
-	Binary string `yaml:"binary"`
-	// CLIArgs is an optional prefix applied to every warp-cli call,
-	// for example ["--accept-tos"] on older client versions.
-	CLIArgs []string `yaml:"cli_args"`
-	// ProxyAddr is the local proxy warp-cli opens in proxy mode.
-	ProxyAddr string `yaml:"proxy_addr"`
-	// ReconnectMode is "reconnect" (disconnect+connect) or
+	// StateDir holds the device identity. Persisted across restarts.
+	StateDir string `yaml:"state_dir"`
+	// ReconnectMode is "reconnect" (close and reopen the tunnel) or
 	// "reregister" (delete registration, register again, connect).
 	ReconnectMode string `yaml:"reconnect_mode"`
 }
@@ -148,10 +142,7 @@ func Defaults() *Config {
 		HTTPProxy: ListenerConfig{Listen: ":8591"},
 		SOCKS:     ListenerConfig{Listen: ":8592"},
 		Warp: WarpConfig{
-			Binary: "warp-cli",
-			// Non-interactive environments must accept the ToS flag.
-			CLIArgs:       []string{"--accept-tos"},
-			ProxyAddr:     "127.0.0.1:40000",
+			StateDir:      "state",
 			ReconnectMode: "reconnect",
 		},
 		Health: HealthConfig{

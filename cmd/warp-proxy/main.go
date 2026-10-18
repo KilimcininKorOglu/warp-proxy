@@ -47,8 +47,8 @@ func main() {
 	logSink := &logSink{logs: logs}
 	slog.SetDefault(logger)
 
-	manager := warp.NewManager(cfg.Warp.Binary, cfg.Warp.CLIArgs, cfg.Warp.ReconnectMode)
-	upstream := &proxy.Upstream{Addr: cfg.Warp.ProxyAddr}
+	manager := warp.NewManager(cfg.Warp.StateDir, cfg.Warp.ReconnectMode)
+	upstream := &proxy.Upstream{DialFunc: manager.Dial}
 
 	// Front rewriting: pool fed by the Clean-IP scan, decisions read the
 	// live config on every request.
@@ -67,7 +67,7 @@ func main() {
 
 	// The health checker must see the tunnel as clients experience WARP,
 	// never a front-rewritten edge, so it gets its own plain upstream.
-	checkerUpstream := &proxy.Upstream{Addr: cfg.Warp.ProxyAddr}
+	checkerUpstream := &proxy.Upstream{DialFunc: manager.Dial}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -83,9 +83,9 @@ func main() {
 	applyLimiter(cfg, checker)
 
 	// Check once at startup so the panel shows real state immediately,
-	// then keep the periodic loop.
+	// then keep the periodic loop. EnsureReady has already run, so the
+	// tunnel is up (or its failure was logged) by the time this starts.
 	go func() {
-		waitUpstream(ctx, checkerUpstream.Addr, 30*time.Second)
 		checker.RunOnce(ctx)
 		checker.Loop(ctx, healthInterval(cfg))
 	}()
@@ -102,8 +102,6 @@ func main() {
 	panel.Logs = logs
 	panel.Logger = logger
 	panel.OnLiveConfigChange = func(c *config.Config) {
-		upstream.Addr = c.Warp.ProxyAddr
-		checkerUpstream.Addr = c.Warp.ProxyAddr
 		manager.SetMode(c.Warp.ReconnectMode)
 		applyLimiter(c, checker)
 	}
@@ -161,7 +159,7 @@ func main() {
 		"http_proxy", cfg.HTTPProxy.Listen,
 		"socks", cfg.SOCKS.Listen,
 		"bridge", cfg.Bridge.Listen,
-		"upstream", cfg.Warp.ProxyAddr)
+		"state_dir", cfg.Warp.StateDir)
 
 	select {
 	case <-ctx.Done():
@@ -230,28 +228,6 @@ func healthInterval(cfg *config.Config) time.Duration {
 		return 5 * time.Minute
 	}
 	return d
-}
-
-// waitUpstream blocks until the upstream proxy accepts TCP connections or
-// the budget runs out, so the first health check does not race warp-cli's
-// listener startup.
-func waitUpstream(ctx context.Context, addr string, budget time.Duration) {
-	deadline := time.Now().Add(budget)
-	for {
-		conn, err := net.DialTimeout("tcp", addr, time.Second)
-		if err == nil {
-			conn.Close()
-			return
-		}
-		if ctx.Err() != nil || time.Now().After(deadline) {
-			return
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(2 * time.Second):
-		}
-	}
 }
 
 // logSink adapts proxy requests into the panel ring buffer.

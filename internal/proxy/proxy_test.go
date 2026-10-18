@@ -3,13 +3,11 @@ package proxy
 import (
 	"bufio"
 	"context"
-	"encoding/binary"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -17,93 +15,16 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-// fakeUpstream is a minimal SOCKS5 proxy standing in for warp-cli.
-type fakeUpstream struct{ ln net.Listener }
-
-func newFakeUpstream(t *testing.T) *fakeUpstream {
+// fakeDialUpstream returns an Upstream whose DialFunc dials the given
+// listener directly, standing in for the tunnel's netstack.
+func fakeDialUpstream(t *testing.T, ln net.Listener) *Upstream {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen upstream: %v", err)
+	return &Upstream{
+		DialFunc: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, ln.Addr().String())
+		},
 	}
-	f := &fakeUpstream{ln: ln}
-	go f.serve()
-	t.Cleanup(func() { ln.Close() })
-	return f
-}
-
-func (f *fakeUpstream) serve() {
-	for {
-		conn, err := f.ln.Accept()
-		if err != nil {
-			return
-		}
-		go f.handle(conn)
-	}
-}
-
-func (f *fakeUpstream) handle(conn net.Conn) {
-	defer conn.Close()
-	br := bufio.NewReader(conn)
-	// Greeting: VER, NMETHODS, METHODS.
-	head := make([]byte, 2)
-	if _, err := io.ReadFull(br, head); err != nil || head[0] != 5 {
-		return
-	}
-	methods := make([]byte, head[1])
-	if _, err := io.ReadFull(br, methods); err != nil {
-		return
-	}
-	if _, err := conn.Write([]byte{5, 0}); err != nil {
-		return
-	}
-	// Request: VER CMD RSV ATYP ADDR PORT.
-	req := make([]byte, 4)
-	if _, err := io.ReadFull(br, req); err != nil || req[1] != 1 {
-		return
-	}
-	var host string
-	switch req[3] {
-	case 1:
-		ip := make([]byte, 4)
-		if _, err := io.ReadFull(br, ip); err != nil {
-			return
-		}
-		host = net.IP(ip).String()
-	case 3:
-		l := make([]byte, 1)
-		if _, err := io.ReadFull(br, l); err != nil {
-			return
-		}
-		name := make([]byte, l[0])
-		if _, err := io.ReadFull(br, name); err != nil {
-			return
-		}
-		host = string(name)
-	case 4:
-		ip := make([]byte, 16)
-		if _, err := io.ReadFull(br, ip); err != nil {
-			return
-		}
-		host = net.IP(ip).String()
-	default:
-		return
-	}
-	port := make([]byte, 2)
-	if _, err := io.ReadFull(br, port); err != nil {
-		return
-	}
-	target, err := net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(int(binary.BigEndian.Uint16(port)))))
-	if err != nil {
-		conn.Write([]byte{5, 4, 0, 1, 0, 0, 0, 0, 0, 0}) // host unreachable
-		return
-	}
-	defer target.Close()
-	conn.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}) // success
-	done := make(chan struct{}, 2)
-	go func() { io.Copy(target, br); done <- struct{}{} }()
-	go func() { io.Copy(conn, target); done <- struct{}{} }()
-	<-done
 }
 
 func startHTTPProxy(t *testing.T, up *Upstream) (addr string) {
@@ -136,8 +57,9 @@ func TestHTTPProxyConnectThroughUpstream(t *testing.T) {
 	}))
 	defer target.Close()
 
-	up := newFakeUpstream(t)
-	addr := startHTTPProxy(t, &Upstream{Addr: up.ln.Addr().String()})
+	tURL, _ := url.Parse(target.URL)
+	up := fakeDialUpstream(t, mustDial(t, tURL.Host))
+	addr := startHTTPProxy(t, up)
 
 	proxyURL, _ := url.Parse("http://" + addr)
 	client := &http.Client{
@@ -161,8 +83,9 @@ func TestHTTPProxyPlainForward(t *testing.T) {
 	}))
 	defer target.Close()
 
-	up := newFakeUpstream(t)
-	addr := startHTTPProxy(t, &Upstream{Addr: up.ln.Addr().String()})
+	tURL, _ := url.Parse(target.URL)
+	up := fakeDialUpstream(t, mustDial(t, tURL.Host))
+	addr := startHTTPProxy(t, up)
 
 	proxyURL, _ := url.Parse("http://" + addr)
 	client := &http.Client{
@@ -187,14 +110,14 @@ func TestSOCKSProxyThroughUpstream(t *testing.T) {
 	}))
 	defer target.Close()
 
-	up := newFakeUpstream(t)
-	socksAddr := startSOCKSProxy(t, &Upstream{Addr: up.ln.Addr().String()})
+	tURL, _ := url.Parse(target.URL)
+	up := fakeDialUpstream(t, mustDial(t, tURL.Host))
+	socksAddr := startSOCKSProxy(t, up)
 
 	dialer, err := proxy.SOCKS5("tcp", socksAddr, nil, proxy.Direct)
 	if err != nil {
 		t.Fatalf("SOCKS5 dialer: %v", err)
 	}
-	tURL, _ := url.Parse(target.URL)
 	conn, err := dialer.Dial("tcp", tURL.Host)
 	if err != nil {
 		t.Fatalf("socks dial: %v", err)
@@ -216,30 +139,64 @@ func TestSOCKSProxyThroughUpstream(t *testing.T) {
 	}
 }
 
-func TestUpstreamRefusedConnectReturnsError(t *testing.T) {
-	// A listener that accepts the greeting but rejects every method stands
-	// in for an upstream that refuses the tunnel.
+func TestUpstreamDialFailureReturnsError(t *testing.T) {
+	// A closed listener stands in for an unreachable tunnel target.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	closed := ln.Addr().String()
+	ln.Close()
+
+	up := &Upstream{
+		DialFunc: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, closed)
+		},
+		Timeout: 3 * time.Second,
+	}
+	if _, err := up.Dial(context.Background(), "tcp", "example.com:443"); err == nil {
+		t.Fatal("Dial succeeded against a dead target")
+	}
+}
+
+func TestUpstreamRejectsNonTCP(t *testing.T) {
+	up := &Upstream{DialFunc: func(context.Context, string, string) (net.Conn, error) {
+		return nil, nil
+	}}
+	if _, err := up.Dial(context.Background(), "udp", "example.com:53"); err == nil {
+		t.Error("udp dial accepted")
+	}
+}
+
+func mustDial(t *testing.T, hostPort string) net.Listener {
+	t.Helper()
+	dialLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen relay: %v", err)
+	}
+	t.Cleanup(func() { dialLn.Close() })
+	// Relay every accepted connection to the target host.
 	go func() {
 		for {
-			conn, err := ln.Accept()
+			src, err := dialLn.Accept()
 			if err != nil {
 				return
 			}
-			buf := make([]byte, 64)
-			conn.Read(buf)
-			conn.Write([]byte{5, 0xFF}) // no acceptable methods
-			conn.Close()
+			go func(src net.Conn) {
+				dst, err := net.Dial("tcp", hostPort)
+				if err != nil {
+					src.Close()
+					return
+				}
+				done := make(chan struct{}, 2)
+				go func() { io.Copy(dst, src); done <- struct{}{} }()
+				go func() { io.Copy(src, dst); done <- struct{}{} }()
+				<-done
+				src.Close()
+				dst.Close()
+			}(src)
 		}
 	}()
-
-	u := &Upstream{Addr: ln.Addr().String(), Timeout: 5 * time.Second}
-	_, err = u.Dial(context.Background(), "tcp", "example.com:443")
-	if err == nil {
-		t.Fatal("Dial succeeded against a refusing upstream")
-	}
+	return dialLn
 }

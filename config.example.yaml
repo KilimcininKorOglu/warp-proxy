@@ -9,11 +9,9 @@ http_proxy:
 socks_proxy:
   listen: ":8592"
 
-# warp-cli driver.
+# Built-in MASQUE tunnel (no warp-cli).
 warp:
-  binary: "warp-cli"
-  cli_args: ["--accept-tos"]   # required in non-interactive environments
-  proxy_addr: "127.0.0.1:40000"
+  state_dir: "state"            # device identity, persisted across restarts
   reconnect_mode: "reconnect"   # or "reregister"
 
 # Periodic check through the WARP tunnel. Generic by default; add bot

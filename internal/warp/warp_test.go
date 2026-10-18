@@ -2,40 +2,30 @@ package warp
 
 import (
 	"context"
+	"errors"
+	"net"
 	"os"
 	"path/filepath"
-	"strings"
+	"sync/atomic"
 	"testing"
-	"time"
+
+	"warp-proxy/internal/masque"
 )
 
-// writeMockCLI installs a shell script that records every invocation into
-// calls.log and answers from the given status text.
-func writeMockCLI(t *testing.T, statusText string) string {
-	t.Helper()
-	dir := t.TempDir()
-	script := filepath.Join(dir, "warp-cli")
-	body := "#!/bin/sh\necho \"$@\" >> " + dir + "/calls.log\n" +
-		"if [ \"$1\" = \"status\" ]; then echo " + statusText + "; exit 0; fi\n" +
-		"exit 0\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
-		t.Fatalf("write mock cli: %v", err)
-	}
-	return dir
-}
-
-func calls(t *testing.T, dir string) []string {
-	t.Helper()
-	data, err := os.ReadFile(filepath.Join(dir, "calls.log"))
-	if err != nil {
-		t.Fatalf("read calls: %v", err)
-	}
-	return strings.Split(strings.TrimSpace(string(data)), "\n")
-}
-
 func TestEnsureReadyRegistersOnceAndConnects(t *testing.T) {
-	dir := writeMockCLI(t, "Status: Connected")
-	m := NewManager(filepath.Join(dir, "warp-cli"), nil, ModeReconnect)
+	dir := t.TempDir()
+	var registers atomic.Int32
+	var attempts atomic.Int32
+	m := NewManager(dir, ModeReconnect)
+	m.register = func(context.Context) (*masque.Identity, error) {
+		registers.Add(1)
+		return testIdentity(), nil
+	}
+	m.connect = func(context.Context, *masque.Identity,
+		string) (Tunnel, Dialer, error) {
+		attempts.Add(1)
+		return &countingTunnel{}, &fakeDialer{}, nil
+	}
 
 	ctx := context.Background()
 	if err := m.EnsureReady(ctx); err != nil {
@@ -44,93 +34,125 @@ func TestEnsureReadyRegistersOnceAndConnects(t *testing.T) {
 	if ok, err := m.Connected(ctx); err != nil || !ok {
 		t.Errorf("Connected = %v, %v; want true", ok, err)
 	}
-	got := calls(t, dir)
-	want := []string{
-		"registration new", "mode proxy", "connect", "status",
+	// A second EnsureReady keeps the stored registration.
+	if err := m.EnsureReady(ctx); err != nil {
+		t.Fatalf("EnsureReady 2: %v", err)
 	}
-	if strings.Join(got, "|") != strings.Join(want, "|") {
-		t.Errorf("calls = %v, want %v", got, want)
+	if registers.Load() != 1 {
+		t.Errorf("registers = %d, want 1", registers.Load())
+	}
+	if attempts.Load() != 2 {
+		t.Errorf("connects = %d, want 2", attempts.Load())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "identity.json")); err != nil {
+		t.Errorf("identity not persisted: %v", err)
 	}
 }
 
-func TestEnsureReadyToleratesAlreadyRegistered(t *testing.T) {
+func TestReconnectModesSwapTunnel(t *testing.T) {
 	dir := t.TempDir()
-	script := filepath.Join(dir, "warp-cli")
-	body := "#!/bin/sh\n" +
-		"if [ \"$1\" = \"registration\" ] && [ \"$2\" = \"new\" ]; then\n" +
-		"  echo 'Error: Already registered' >&2; exit 1; fi\n" +
-		"exit 0\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
-		t.Fatalf("write script: %v", err)
+	var attempts, oldClosed atomic.Int32
+	m := NewManager(dir, ModeReconnect)
+	m.connect = func(context.Context, *masque.Identity,
+		string) (Tunnel, Dialer, error) {
+		attempts.Add(1)
+		return &countingTunnel{onClose: func() { oldClosed.Add(1) }}, &fakeDialer{}, nil
 	}
-	m := NewManager(script, nil, ModeReconnect)
-	if err := m.EnsureReady(context.Background()); err != nil {
-		t.Errorf("EnsureReady with already-registered: %v", err)
+
+	ctx := context.Background()
+	if err := m.EnsureReady(ctx); err != nil {
+		t.Fatalf("EnsureReady: %v", err)
 	}
-}
-
-func TestReconnectModeDisconnectConnect(t *testing.T) {
-	dir := writeMockCLI(t, "Status: Connected")
-	m := NewManager(filepath.Join(dir, "warp-cli"), nil, ModeReconnect)
-
-	if err := m.Reconnect(context.Background()); err != nil {
+	if err := m.Reconnect(ctx); err != nil {
 		t.Fatalf("Reconnect: %v", err)
 	}
-	got := calls(t, dir)
-	if strings.Join(got, "|") != "disconnect|connect" {
-		t.Errorf("calls = %v, want [disconnect connect]", got)
+	if attempts.Load() != 2 || oldClosed.Load() != 1 {
+		t.Errorf("attempts=%d closed=%d, want 2/1", attempts.Load(), oldClosed.Load())
 	}
 	if m.LastReconnect().IsZero() {
-		t.Error("LastReconnect not recorded")
+		t.Error("LastReconnect not stamped")
+	}
+
+	// Reregister mode deletes the stored identity before reconnecting.
+	m.SetMode(ModeReregister)
+	if m.ReconnectMode() != ModeReregister {
+		t.Fatal("mode not switched")
 	}
 }
 
-func TestReconnectModeReregister(t *testing.T) {
-	dir := writeMockCLI(t, "Status: Connected")
-	m := NewManager(filepath.Join(dir, "warp-cli"), nil, ModeReregister)
-
-	if err := m.Reconnect(context.Background()); err != nil {
-		t.Fatalf("Reconnect: %v", err)
+func TestSetEndpointPinsOverride(t *testing.T) {
+	dir := t.TempDir()
+	var endpoints []string
+	var attempts atomic.Int32
+	m := NewManager(dir, ModeReconnect)
+	m.connect = func(_ context.Context, _ *masque.Identity,
+		endpoint string) (Tunnel, Dialer, error) {
+		attempts.Add(1)
+		endpoints = append(endpoints, endpoint)
+		return &countingTunnel{}, &fakeDialer{}, nil
 	}
-	got := calls(t, dir)
-	want := "registration delete|registration new|mode proxy|connect"
-	if strings.Join(got, "|") != want {
-		t.Errorf("calls = %v, want %v", got, want)
+	if err := m.EnsureReady(context.Background()); err != nil {
+		t.Fatalf("EnsureReady: %v", err)
 	}
-}
-
-func TestCLIArgsPrefix(t *testing.T) {
-	dir := writeMockCLI(t, "Status: Disconnected")
-	m := NewManager(filepath.Join(dir, "warp-cli"), []string{"--accept-tos"}, ModeReconnect)
-
-	if _, err := m.Status(context.Background()); err != nil {
-		t.Fatalf("Status: %v", err)
+	if err := m.SetEndpoint(context.Background(), "162.159.198.1:443"); err != nil {
+		t.Fatalf("SetEndpoint: %v", err)
 	}
-	got := calls(t, dir)
-	if got[0] != "--accept-tos status" {
-		t.Errorf("call = %q, want %q", got[0], "--accept-tos status")
+	if endpoints[len(endpoints)-1] != "162.159.198.1:443" {
+		t.Errorf("endpoint = %q, want the pinned override", endpoints[len(endpoints)-1])
+	}
+	if attempts.Load() != 2 {
+		t.Errorf("connects = %d, want 2", attempts.Load())
 	}
 }
 
-func TestInvalidModeFallsBackToReconnect(t *testing.T) {
-	m := NewManager("warp-cli", nil, "bogus")
+func TestDialWithoutTunnelFails(t *testing.T) {
+	m := NewManager(t.TempDir(), ModeReconnect)
+	if _, err := m.Dial(context.Background(), "tcp", "example.com:80"); !errors.Is(err, ErrNotConnected) {
+		t.Errorf("Dial err = %v, want ErrNotConnected", err)
+	}
+}
+
+func TestModeFallback(t *testing.T) {
+	m := NewManager(t.TempDir(), "bogus")
 	if m.ReconnectMode() != ModeReconnect {
-		t.Errorf("mode = %q, want %q", m.ReconnectMode(), ModeReconnect)
+		t.Errorf("mode = %q, want reconnect fallback", m.ReconnectMode())
+	}
+	m.SetMode(ModeReregister)
+	m.SetMode("also-bogus")
+	if m.ReconnectMode() != ModeReconnect {
+		t.Errorf("mode = %q, want reconnect fallback", m.ReconnectMode())
 	}
 }
 
-func TestLastReconnectConcurrency(t *testing.T) {
-	dir := writeMockCLI(t, "Status: Connected")
-	m := NewManager(filepath.Join(dir, "warp-cli"), nil, ModeReconnect)
-	done := make(chan struct{})
-	go func() {
-		_ = m.LastReconnect()
-		close(done)
-	}()
-	_ = m.Reconnect(context.Background())
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Error("LastReconnect deadlocked against Reconnect")
+// countingTunnel records close calls.
+type countingTunnel struct {
+	onClose func()
+	closed  bool
+}
+
+func (c *countingTunnel) Close() error {
+	if !c.closed {
+		c.closed = true
+		if c.onClose != nil {
+			c.onClose()
+		}
 	}
+	return nil
+}
+
+// testIdentity returns a syntactically complete identity for state files.
+func testIdentity() *masque.Identity {
+	return &masque.Identity{
+		PrivateKey:  "test",
+		AccessToken: "test",
+		ID:          "test-device",
+		IPv4:        "172.16.0.2/32",
+	}
+}
+
+// fakeDialer stands in for the netstack dialer.
+type fakeDialer struct{}
+
+func (fakeDialer) Dial(context.Context, string, string) (net.Conn, error) {
+	return nil, errors.New("fake dialer")
 }

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -13,7 +14,6 @@ import (
 
 	"warp-proxy/internal/config"
 	"warp-proxy/internal/logbuf"
-	"warp-proxy/internal/proxy"
 )
 
 func TestRetryAfterParsing(t *testing.T) {
@@ -79,8 +79,9 @@ func TestRetryable(t *testing.T) {
 	}
 }
 
-// startBridge wires a bridge Server to a scripted upstream through the SOCKS5
-// fake (the warp-cli stand-in) and returns the client-facing bridge server.
+// startBridge wires a bridge Server to a scripted upstream through the
+// direct-dial fake (the tunnel stand-in) and returns the client-facing
+// bridge server.
 // inject toggles free-tier session injection, retryAttempts bounds replays,
 // rotateSessionOnRetry refreshes the injected ids after a WARP rotation.
 func startBridge(t *testing.T, upstreamHandler http.HandlerFunc,
@@ -88,9 +89,9 @@ func startBridge(t *testing.T, upstreamHandler http.HandlerFunc,
 	rotateSessionOnRetry bool) *httptest.Server {
 	t.Helper()
 
-	socksLn := fakeSocks(t)
 	upstream := httptest.NewServer(upstreamHandler)
 	t.Cleanup(upstream.Close)
+	tURL, _ := url.Parse(upstream.URL)
 
 	cfg := func() config.BridgeConfig {
 		return config.BridgeConfig{
@@ -105,16 +106,15 @@ func startBridge(t *testing.T, upstreamHandler http.HandlerFunc,
 			RotateSessionOnRetry: rotateSessionOnRetry,
 		}
 	}
-	srv := New(&proxy.Upstream{Addr: socksLn, Timeout: 5 * time.Second},
-		logbuf.New(32), discardLogger(), rotate, cfg)
+	srv := New(dialUpstream(tURL.Host), logbuf.New(32), discardLogger(), rotate, cfg)
 
 	bridge := httptest.NewServer(srv)
 	t.Cleanup(bridge.Close)
 	return bridge
 }
 
-// fixture wires a bridge Server to a scripted upstream through the SOCKS5
-// fake, reimplemented here for isolation.
+// fixture wires a bridge Server to a scripted upstream, reimplemented here
+// for isolation.
 func fixture(t *testing.T, upstreamHandler http.HandlerFunc, rotations *atomic.Int32) *httptest.Server {
 	t.Helper()
 	rotate := func(context.Context) error {

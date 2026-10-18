@@ -10,7 +10,6 @@
     <tr><th>HTTP proxy portu</th><td><input type="text" name="http_listen" value="{{.Cfg.HTTPProxy.Listen}}"></td></tr>
     <tr><th>SOCKS5 proxy portu</th><td><input type="text" name="socks_listen" value="{{.Cfg.SOCKS.Listen}}"></td></tr>
     <tr><th>warp-cli binary</th><td><input type="text" name="warp_binary" value="{{.Cfg.Warp.Binary}}"></td></tr>
-    <tr><th>WARP proxy adresi</th><td><input type="text" name="warp_proxy_addr" value="{{.Cfg.Warp.ProxyAddr}}"></td></tr>
     <tr><th>Reconnect modu</th>
       <td><select name="reconnect_mode">
         <option value="reconnect" {{if eq .Cfg.Warp.ReconnectMode "reconnect"}}selected{{end}}>reconnect (disconnect + connect)</option>
