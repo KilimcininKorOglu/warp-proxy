@@ -1,0 +1,37 @@
+{{template "head" .}}
+
+{{if .Saved}}<div class="flash">Ayarlar kaydedildi. Listener portu değişiklikleri yeniden başlatma ister; diğerleri hemen uygulanır.</div>{{end}}
+
+<div class="card">
+  <h2>Ayarlar</h2>
+  <form method="post" action="/settings">
+  <table>
+    <tr><th>Panel portu</th><td><input type="text" name="panel_listen" value="{{.Cfg.Panel.Listen}}"></td></tr>
+    <tr><th>HTTP proxy portu</th><td><input type="text" name="http_listen" value="{{.Cfg.HTTPProxy.Listen}}"></td></tr>
+    <tr><th>SOCKS5 proxy portu</th><td><input type="text" name="socks_listen" value="{{.Cfg.SOCKS.Listen}}"></td></tr>
+    <tr><th>warp-cli binary</th><td><input type="text" name="warp_binary" value="{{.Cfg.Warp.Binary}}"></td></tr>
+    <tr><th>WARP proxy adresi</th><td><input type="text" name="warp_proxy_addr" value="{{.Cfg.Warp.ProxyAddr}}"></td></tr>
+    <tr><th>Reconnect modu</th>
+      <td><select name="reconnect_mode">
+        <option value="reconnect" {{if eq .Cfg.Warp.ReconnectMode "reconnect"}}selected{{end}}>reconnect (disconnect + connect)</option>
+        <option value="reregister" {{if eq .Cfg.Warp.ReconnectMode "reregister"}}selected{{end}}>reregister (kayıt sil + yenile)</option>
+      </select></td></tr>
+    <tr><th>Health-check</th>
+      <td><label><input type="checkbox" name="health_enabled" {{if .Cfg.Health.Enabled}}checked{{end}} style="width:auto"> açık</label></td></tr>
+    <tr><th>Kontrol aralığı</th><td><input type="text" name="health_interval" value="{{.Cfg.Health.Interval}}"></td></tr>
+    <tr><th>Kontrol timeout</th><td><input type="text" name="health_timeout" value="{{.Cfg.Health.Timeout}}"></td></tr>
+    <tr><th>Health URL</th><td><input type="text" name="health_url" value="{{.Cfg.Health.URL}}"></td></tr>
+    <tr><th>Trace URL</th><td><input type="text" name="trace_url" value="{{.Cfg.Health.TraceURL}}">
+      <div class="muted">Çıkış IP ve warp=on doğrulaması için. Boş bırakılırsa IP ölçülmez.</div></td></tr>
+    <tr><th>Bot marker'lar</th>
+      <td><textarea name="bot_markers">{{range .Cfg.Health.BotMarkers}}{{.}}
+{{end}}</textarea>
+      <div class="muted">Her satır bir marker. Yanıt içinde geçen marker flag sayılır. Genel amaçlı kullanım için boş bırakabilirsin; o zaman yalnız HTTP hatası ve warp=off sorun sayılır.</div></td></tr>
+    <tr><th>Min reconnect aralığı</th><td><input type="text" name="min_interval" value="{{.Cfg.Reconnect.MinInterval}}"></td></tr>
+    <tr><th>Üst üste reconnect sınırı</th><td><input type="text" name="max_consecutive" value="{{.Cfg.Reconnect.MaxConsecutive}}"></td></tr>
+    <tr><th>Cooldown</th><td><input type="text" name="cooldown" value="{{.Cfg.Reconnect.CooldownAfterBurst}}"></td></tr>
+  </table>
+  <p><button type="submit">Kaydet</button></p>
+  </form>
+</div>
+{{template "foot" .}}

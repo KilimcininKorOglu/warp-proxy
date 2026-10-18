@@ -1,0 +1,37 @@
+{{template "head" .}}
+
+<div class="card">
+  <h2>WARP durumu</h2>
+  <table>
+    <tr><th>Sağlık</th>
+      <td>{{if not .Health.Enabled}}<span class="pill warn">Health-check kapalı</span>
+      {{else if .Health.Healthy}}<span class="pill ok">Sağlıklı</span>
+      {{else}}<span class="pill err">Sorunlu</span>{{end}}</td></tr>
+    <tr><th>warp-cli</th>
+      <td>{{if .WarpError}}<span class="pill err">warp-cli hatası</span>{{end}}
+      <span class="log">{{.WarpStatus}}</span></td></tr>
+    <tr><th>Çıkış IP</th><td>{{if .Health.ExitIP}}{{.Health.ExitIP}}{{else}}<span class="muted">henüz ölçülmedi</span>{{end}}</td></tr>
+    <tr><th>WARP</th><td>{{if .Health.WarpOn}}<span class="pill ok">warp=on</span>{{else}}<span class="pill warn">warp=off / bilinmiyor</span>{{end}}</td></tr>
+    <tr><th>Son kontrol</th><td>{{if .Health.LastRun.IsZero}}<span class="muted">yok</span>{{else}}{{.Health.LastRun.Format "02.01.2006 15:04:05"}}{{end}}
+      {{if .Health.LastError}}<div class="muted">{{.Health.LastError}}</div>{{end}}</td></tr>
+    <tr><th>Son flag</th><td>{{if .Health.LastFlagAt.IsZero}}<span class="muted">yok</span>{{else}}{{.Health.LastFlagAt.Format "02.01.2006 15:04:05"}}{{end}}</td></tr>
+  </table>
+  <p>
+    <form class="inline" method="post" action="/reconnect">
+      <button type="submit">Reconnect (yeni IP)</button>
+    </form>
+    <span class="muted">Rate-limit'lidir; reddedilirse log sayfasında gerekçe yazar.</span>
+  </p>
+</div>
+
+<div class="card">
+  <h2>Reconnect sayaçları</h2>
+  <table>
+    <tr><th>Mod</th><td>{{.Mode}}</td></tr>
+    <tr><th>Toplam reconnect</th><td>{{.Limiter.TotalReconnects}}</td></tr>
+    <tr><th>Üst üste başarısız</th><td>{{.Limiter.Consecutive}}</td></tr>
+    <tr><th>Son deneme</th><td>{{if .Limiter.LastAttempt.IsZero}}<span class="muted">yok</span>{{else}}{{.Limiter.LastAttempt.Format "02.01.2006 15:04:05"}}{{end}}</td></tr>
+    <tr><th>Cooldown bitişi</th><td>{{if .Limiter.CooldownUntil.IsZero}}<span class="muted">yok</span>{{else}}{{.Limiter.CooldownUntil.Format "02.01.2006 15:04:05"}}{{end}}</td></tr>
+  </table>
+</div>
+{{template "foot" .}}

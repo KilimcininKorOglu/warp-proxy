@@ -1,0 +1,13 @@
+{{template "head" .}}
+<div class="card" style="max-width:380px;margin:64px auto 0;">
+  <h2>Panel girişi</h2>
+  {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+  <form method="post" action="/login">
+    <table>
+      <tr><th>Kullanıcı adı</th><td><input type="text" name="username" autofocus autocomplete="username"></td></tr>
+      <tr><th>Şifre</th><td><input type="password" name="password" autocomplete="current-password"></td></tr>
+    </table>
+    <p><button type="submit">Giriş</button></p>
+  </form>
+</div>
+{{template "foot" .}}

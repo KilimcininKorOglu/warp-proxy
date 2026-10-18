@@ -1,0 +1,56 @@
+{{define "head"}}
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>warp-proxy</title>
+<style>
+  :root { --bg:#f5f6f8; --card:#ffffff; --text:#1c2430; --muted:#6b7684; --accent:#3b6ef5; --border:#d9dee5; --ok:#1d8a4e; --warn:#b56a00; --err:#c22f2f; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { background:var(--card); border-bottom:1px solid var(--border); padding:12px 24px; display:flex; align-items:center; gap:24px; }
+  header a { color:var(--muted); text-decoration:none; }
+  header a.active { color:var(--text); font-weight:600; }
+  header .spacer { flex:1; }
+  main { max-width:880px; margin:24px auto; padding:0 16px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:20px 24px; margin-bottom:16px; }
+  h1 { font-size:18px; margin:0 16px 0 0; }
+  h2 { font-size:15px; margin:0 0 12px; }
+  table { border-collapse:collapse; width:100%; }
+  td, th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--border); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; width:220px; }
+  .pill { display:inline-block; padding:2px 10px; border-radius:12px; font-size:13px; font-weight:600; }
+  .pill.ok { background:#e2f3e8; color:var(--ok); }
+  .pill.warn { background:#fdf0dc; color:var(--warn); }
+  .pill.err { background:#fbe4e4; color:var(--err); }
+  input[type=text], input[type=password], textarea, select {
+    width:100%; padding:8px 10px; border:1px solid var(--border); border-radius:6px; font:inherit; color:var(--text); background:#fff; }
+  textarea { min-height:90px; resize:vertical; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:6px; padding:9px 18px; font:inherit; font-weight:600; cursor:pointer; }
+  button.secondary { background:var(--card); color:var(--text); border:1px solid var(--border); }
+  .log { font-family:ui-monospace, Menlo, monospace; font-size:13px; }
+  .log td { border-bottom:1px solid #eef0f3; white-space:pre-wrap; word-break:break-word; }
+  .muted { color:var(--muted); font-size:13px; }
+  .flash { background:#e2f3e8; color:var(--ok); border-radius:6px; padding:10px 14px; margin-bottom:16px; }
+  .error { background:#fbe4e4; color:var(--err); border-radius:6px; padding:10px 14px; margin-bottom:16px; }
+  form.inline { display:inline; }
+</style>
+</head>
+<body>
+<header>
+  <h1>warp-proxy</h1>
+  <a href="/">Durum</a>
+  <a href="/settings">Ayarlar</a>
+  <a href="/logs">Log</a>
+  <span class="spacer"></span>
+  <form class="inline" method="post" action="/logout"><button class="secondary" type="submit">Çıkış</button></form>
+</header>
+<main>
+{{end}}
+
+{{define "foot"}}
+</main>
+</body>
+</html>
+{{end}}

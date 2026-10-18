@@ -1,0 +1,24 @@
+{{template "head" .}}
+
+<div class="card">
+  <h2>Log</h2>
+  <form class="inline" method="post" action="/logs/clear">
+    <button class="secondary" type="submit">Temizle</button>
+  </form>
+  <span class="muted">En yeni kayıt en üstte, son 500 kayıt.</span>
+</div>
+
+<div class="card">
+  {{if not .Entries}}<p class="muted">Kayıt yok.</p>{{else}}
+  <table class="log">
+    {{range .Entries}}
+    <tr>
+      <td style="width:150px">{{.Time.Format "02.01.2006 15:04:05"}}</td>
+      <td style="width:90px">{{.Kind}}</td>
+      <td>{{.Text}}</td>
+    </tr>
+    {{end}}
+  </table>
+  {{end}}
+</div>
+{{template "foot" .}}

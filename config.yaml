@@ -1,0 +1,40 @@
+# warp-proxy configuration.
+# Panel listener (admin web UI).
+panel:
+  listen: ":8590"
+
+# Client facing proxies. Every connection goes out through WARP.
+http_proxy:
+  listen: ":8591"
+socks_proxy:
+  listen: ":8592"
+
+# warp-cli driver.
+warp:
+  binary: "warp-cli"
+  cli_args: []          # example for old clients: ["--accept-tos"]
+  proxy_addr: "127.0.0.1:40000"
+  reconnect_mode: "reconnect"   # or "reregister"
+
+# Periodic check through the WARP tunnel. Generic by default; add bot
+# markers only if your use case needs marker detection (for example the
+# YouTube check). An empty marker list means only transport errors and
+# warp=off count as failures.
+health:
+  enabled: true
+  interval: "5m"
+  timeout: "30s"
+  url: "https://www.cloudflare.com/cdn-cgi/trace"
+  trace_url: "https://www.cloudflare.com/cdn-cgi/trace"
+  bot_markers: []
+
+# Reconnect rate limiting.
+reconnect:
+  min_interval: "60s"
+  max_consecutive: 5
+  cooldown_after_burst: "10m"
+
+# Panel login. The password is written on first start from the
+# WARP_PROXY_PASSWORD environment variable; only the bcrypt hash is stored.
+auth:
+  username: "admin"
