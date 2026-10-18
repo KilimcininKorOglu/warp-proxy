@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"warp-proxy/internal/bridge"
 	"warp-proxy/internal/cleanip"
 	"warp-proxy/internal/config"
 	"warp-proxy/internal/front"
@@ -138,16 +139,29 @@ func main() {
 		logger.Error("socks listen failed", "addr", cfg.SOCKS.Listen, "err", err)
 		os.Exit(1)
 	}
+
+	errCh := make(chan error, 4)
+	go func() { errCh <- http.Serve(lnPanel, panel.Handler()) }()
+	go func() { errCh <- httpSrv.Serve(lnHTTP) }()
+	go func() { errCh <- socksSrv.Serve(lnSOCKS) }()
+
+	if cfg.Bridge.Enabled {
+		bridgeSrv := bridge.New(checkerUpstream, logs, logger,
+			checker.ManualReconnect, func() config.BridgeConfig { return cfg.Bridge })
+		lnBridge, err := net.Listen("tcp", cfg.Bridge.Listen)
+		if err != nil {
+			logger.Error("bridge listen failed", "addr", cfg.Bridge.Listen, "err", err)
+			os.Exit(1)
+		}
+		go func() { errCh <- http.Serve(lnBridge, bridgeSrv) }()
+	}
+
 	logger.Info("warp-proxy started",
 		"panel", cfg.Panel.Listen,
 		"http_proxy", cfg.HTTPProxy.Listen,
 		"socks", cfg.SOCKS.Listen,
+		"bridge", cfg.Bridge.Listen,
 		"upstream", cfg.Warp.ProxyAddr)
-
-	errCh := make(chan error, 3)
-	go func() { errCh <- http.Serve(lnPanel, panel.Handler()) }()
-	go func() { errCh <- httpSrv.Serve(lnHTTP) }()
-	go func() { errCh <- socksSrv.Serve(lnSOCKS) }()
 
 	select {
 	case <-ctx.Done():

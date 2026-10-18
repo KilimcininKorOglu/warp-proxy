@@ -248,6 +248,32 @@ func applyForm(cfg *config.Config, r *http.Request) {
 	cfg.Front.Enabled = r.FormValue("front_enabled") == "on"
 	cfg.Front.Domains = splitLines(r.FormValue("front_domains"))
 	cfg.Front.ResolveCacheTTL = formOr(r, "front_cache_ttl", cfg.Front.ResolveCacheTTL)
+	cfg.Bridge.Enabled = r.FormValue("bridge_enabled") == "on"
+	cfg.Bridge.Listen = formOr(r, "bridge_listen", cfg.Bridge.Listen)
+	cfg.Bridge.Upstream = formOr(r, "bridge_upstream", cfg.Bridge.Upstream)
+	cfg.Bridge.RetryStatuses = parseInts(r.FormValue("bridge_retry_statuses"))
+	cfg.Bridge.RetryAttempts = formIntOr(r, "bridge_retry_attempts", cfg.Bridge.RetryAttempts)
+	cfg.Bridge.MaxConcurrent = formIntOr(r, "bridge_max_concurrent", cfg.Bridge.MaxConcurrent)
+	cfg.Bridge.MinInterval = formOr(r, "bridge_min_interval", cfg.Bridge.MinInterval)
+	cfg.Bridge.Timeout = formOr(r, "bridge_timeout", cfg.Bridge.Timeout)
+}
+
+// parseInts parses a comma-separated integer list; an empty or invalid
+// value yields nil.
+func parseInts(v string) []int {
+	var out []int
+	for part := range strings.SplitSeq(v, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		n, err := strconv.Atoi(part)
+		if err != nil {
+			return nil
+		}
+		out = append(out, n)
+	}
+	return out
 }
 
 func formOr(r *http.Request, key, fallback string) string {

@@ -38,6 +38,17 @@
 {{end}}</textarea>
       <div class="muted">Her satır bir suffix. Bu listedeki hedefler CF tespitinden bağımsız olarak front IP'den bağlanır.</div></td></tr>
     <tr><th>Front cache TTL</th><td><input type="text" name="front_cache_ttl" value="{{.Cfg.Front.ResolveCacheTTL}}"></td></tr>
+    <tr><th>AI bridge</th>
+      <td><label><input type="checkbox" name="bridge_enabled" {{if .Cfg.Bridge.Enabled}}checked{{end}} style="width:auto"> açık</label>
+      <div class="muted">OpenAI-uyumlu reverse proxy: upstream 429 dönerse WARP IP'sini çevirip isteği tekrar eder. İstekler olduğu gibi iletilir; header eklenmez.</div></td></tr>
+    <tr><th>Bridge portu</th><td><input type="text" name="bridge_listen" value="{{.Cfg.Bridge.Listen}}"></td></tr>
+    <tr><th>Bridge upstream</th><td><input type="text" name="bridge_upstream" value="{{.Cfg.Bridge.Upstream}}"></td></tr>
+    <tr><th>Retry statusleri</th><td><input type="text" name="bridge_retry_statuses" value="{{range $i, $s := .Cfg.Bridge.RetryStatuses}}{{if $i}},{{end}}{{$s}}{{end}}">
+      <div class="muted">Virgülle ayrılmış, örn. 429</div></td></tr>
+    <tr><th>Retry denemesi</th><td><input type="text" name="bridge_retry_attempts" value="{{.Cfg.Bridge.RetryAttempts}}"></td></tr>
+    <tr><th>Bridge eşzamanlılık</th><td><input type="text" name="bridge_max_concurrent" value="{{.Cfg.Bridge.MaxConcurrent}}"></td></tr>
+    <tr><th>Bridge min aralık</th><td><input type="text" name="bridge_min_interval" value="{{.Cfg.Bridge.MinInterval}}"></td></tr>
+    <tr><th>Bridge timeout</th><td><input type="text" name="bridge_timeout" value="{{.Cfg.Bridge.Timeout}}"></td></tr>
   </table>
   <p><button type="submit">Kaydet</button></p>
   </form>

@@ -50,6 +50,21 @@ front:
   domains: []            # extra suffixes always fronted, e.g. ["example.com"]
   resolve_cache_ttl: "10m"
 
+# AI bridge: an OpenAI-compatible reverse proxy that forwards requests to
+# the upstream through WARP and replays after a WARP IP rotation when the
+# upstream answers with a retryable status (429). Requests are forwarded
+# unchanged; the bridge adds no headers. Point the AI client's baseURL at
+# http://<host>:8593/v1.
+bridge:
+  enabled: true
+  listen: ":8593"
+  upstream: "https://opencode.ai/zen"
+  retry_statuses: [429]
+  retry_attempts: 1
+  max_concurrent: 3
+  min_interval: "0.5s"
+  timeout: "120s"
+
 # Panel login. The password is written on first start from the
 # WARP_PROXY_PASSWORD environment variable; only the bcrypt hash is stored.
 auth:

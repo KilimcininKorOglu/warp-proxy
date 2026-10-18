@@ -23,7 +23,40 @@ type Config struct {
 	Reconnect ReconnectConfig `yaml:"reconnect"`
 	CleanIP   CleanIPConfig   `yaml:"cleanip"`
 	Front     FrontConfig     `yaml:"front"`
+	Bridge    BridgeConfig    `yaml:"bridge"`
 	Auth      AuthConfig      `yaml:"auth"`
+}
+
+// BridgeConfig configures the OpenAI-compatible AI bridge listener that
+// replays requests after a WARP rotation on retryable upstream statuses.
+type BridgeConfig struct {
+	Enabled       bool   `yaml:"enabled"`
+	Listen        string `yaml:"listen"`
+	Upstream      string `yaml:"upstream"`
+	RetryStatuses []int  `yaml:"retry_statuses"`
+	RetryAttempts int    `yaml:"retry_attempts"`
+	MaxConcurrent int    `yaml:"max_concurrent"`
+	MinInterval   string `yaml:"min_interval"`
+	Timeout       string `yaml:"timeout"`
+}
+
+// TimeoutDur parses the configured upstream timeout.
+func (b BridgeConfig) TimeoutDur() time.Duration {
+	d, err := time.ParseDuration(b.Timeout)
+	if err != nil || d <= 0 {
+		return 120 * time.Second
+	}
+	return d
+}
+
+// MinIntervalDur parses the configured minimum spacing between upstream
+// calls.
+func (b BridgeConfig) MinIntervalDur() time.Duration {
+	d, err := time.ParseDuration(b.MinInterval)
+	if err != nil || d < 0 {
+		return 0
+	}
+	return d
 }
 
 // FrontConfig configures Cloudflare front-IP rewriting for proxied
@@ -133,6 +166,16 @@ func Defaults() *Config {
 		Front: FrontConfig{
 			Enabled:         false,
 			ResolveCacheTTL: "10m",
+		},
+		Bridge: BridgeConfig{
+			Enabled:       true,
+			Listen:        ":8593",
+			Upstream:      "https://opencode.ai/zen",
+			RetryStatuses: []int{429},
+			RetryAttempts: 1,
+			MaxConcurrent: 3,
+			MinInterval:   "0.5s",
+			Timeout:       "120s",
 		},
 		Auth: AuthConfig{Username: "admin"},
 	}
