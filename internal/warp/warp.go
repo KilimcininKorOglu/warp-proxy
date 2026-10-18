@@ -12,7 +12,6 @@ import (
 	"os"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"warp-proxy/internal/masque"
@@ -43,7 +42,7 @@ type IdentityFunc = func(ctx context.Context) (*masque.Identity, error)
 type ConnectFunc = func(ctx context.Context, id *masque.Identity,
 	endpoint string) (Tunnel, Dialer, error)
 
-// worker is one account's live tunnel.
+// worker is one account: a stored identity plus, when active, its tunnel.
 type worker struct {
 	index int
 	id    *masque.Identity
@@ -51,10 +50,13 @@ type worker struct {
 	d     Dialer
 }
 
-// Manager keeps a pool of WARP identities and their live tunnels. With one
-// account it behaves exactly like a single tunnel; with more, dials rotate
-// round-robin across the healthy workers and Reconnect rotates to the next
-// worker instead of bouncing the active one.
+// Manager keeps a pool of WARP identities. Exactly one identity's tunnel is
+// active at a time: Cloudflare keys the WARP egress IP on the client host
+// and hands each NEW tunnel session the next egress, so simultaneous
+// tunnels would all share one IP. Rotation therefore means opening the next
+// identity's fresh session and closing the old tunnel afterwards — a new
+// egress without re-registration. With one account it behaves like a single
+// tunnel.
 type Manager struct {
 	stateDir string
 	accounts int
@@ -66,13 +68,13 @@ type Manager struct {
 
 	mu       sync.RWMutex
 	workers  []*worker
-	rr       atomic.Uint64
+	active   int    // the worker owning the live tunnel
 	endpoint string // pin override applied at the next (re)connect
 	last     time.Time
 }
 
 // NewManager builds a Manager persisting identity state under stateDir and
-// maintaining accounts tunnels.
+// rotating across accounts accounts.
 func NewManager(stateDir string, reconnectMode string, accounts int) *Manager {
 	if accounts < 1 {
 		accounts = 1
@@ -103,197 +105,152 @@ func (m *Manager) LastReconnect() time.Time {
 	return m.last
 }
 
-// Dial routes a connection through a healthy tunnel's netstack,
-// round-robin across the pool. It implements the proxy.Upstream contract.
+// Dial routes a connection through the active tunnel's netstack. It
+// implements the proxy.Upstream contract.
 func (m *Manager) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
-	d, err := m.pickDialer()
+	w, err := m.activeWorker()
 	if err != nil {
 		return nil, err
 	}
-	return d.Dial(ctx, network, addr)
+	return w.d.Dial(ctx, network, addr)
 }
 
-// ResolveIP resolves a hostname through the tunnel's remote DNS.
+// ResolveIP resolves a hostname through the active tunnel's remote DNS.
 func (m *Manager) ResolveIP(ctx context.Context, host string) (net.IP, error) {
-	m.mu.RLock()
-	var d Dialer
-	if len(m.workers) > 0 {
-		d = m.workers[0].d
-	}
-	m.mu.RUnlock()
-	if d == nil {
+	w, werr := m.activeWorker()
+	if w == nil || werr != nil {
 		return nil, ErrNotConnected
 	}
-	ip, rerr := d.Resolve(ctx, host)
-	if rerr != nil {
-		return nil, fmt.Errorf("dns: %w", rerr)
-	}
-	return ip, nil
+	ip, rerr := w.d.Resolve(ctx, host)
+	return ip, wrapResolve(host, ip, rerr)
 }
 
-// pickDialer returns the dialer of the next healthy worker, scanning the
-// pool once from the round-robin position.
-func (m *Manager) pickDialer() (Dialer, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	n := len(m.workers)
-	if n == 0 {
-		return nil, ErrNotConnected
+// wrapResolve annotates a resolver failure with the queried host.
+func wrapResolve(host string, ip net.IP, err error) error {
+	if err == nil && ip == nil {
+		return fmt.Errorf("dns: no address for %s", host)
 	}
-	start := int(m.rr.Add(1)) % n
-	for i := 0; i < n; i++ {
-		idx := (start + i) % n
-		w := m.workers[idx]
-		if w != nil && w.d != nil {
-			h2Debug("dial via worker %d", idx)
-			return w.d, nil
-		}
+	if err != nil {
+		return fmt.Errorf("dns: %w", err)
 	}
-	return nil, ErrNotConnected
+	return nil
 }
 
-// EnsureReady brings the pool up: one tunnel per configured account, keeping
-// existing registrations. Failure of some workers is tolerated as long as
-// at least one comes up.
+// EnsureReady brings the active account's tunnel up, keeping existing
+// registrations and a tunnel that is already live.
 func (m *Manager) EnsureReady(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.bringUpLocked(ctx, m.endpoint)
+	m.ensureWorkersLocked()
+	if m.activeWorkerLocked() != nil {
+		return nil
+	}
+	return m.connectLocked(ctx, m.active, m.endpoint)
 }
 
-// Reconnect refreshes the pool. With a single account it re-establishes the
-// tunnel (reregister mode deletes the registration first). With a pool it
-// rotates the round-robin to the next worker for instant egress change and
-// heals the abandoned worker in the background.
+// Reconnect refreshes the egress. With a single account it re-establishes
+// the tunnel (reregister mode deletes the registration first). With a pool
+// it opens the next identity's fresh session — which Cloudflare answers
+// with the next egress IP — and closes the previous tunnel only after the
+// new one is up, so a failed rotation keeps the old egress working.
 func (m *Manager) Reconnect(ctx context.Context) error {
-	if m.poolSize() > 1 {
-		return m.rotate(ctx)
-	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.mode == ModeReregister {
-		if err := m.reregisterLocked(ctx, 0); err != nil {
-			return err
-		}
-	} else {
-		if err := m.connectLocked(ctx, 0, m.endpoint); err != nil {
-			return err
-		}
+	next := m.active
+	if m.poolSize() > 1 {
+		next = (m.active + 1) % m.poolSize()
+	}
+	if err := m.connectLocked(ctx, next, m.endpoint); err != nil {
+		return err
+	}
+	if next != m.active {
+		// nils tear the old tunnel down; the identity file stays.
+		m.swap(m.active, nil, nil)
+		m.active = next
 	}
 	m.last = time.Now()
 	return nil
 }
 
-// SetEndpoint pins the tunnels to a custom edge endpoint ("host:port") and
-// reconnects every worker so the change takes effect.
+// SetEndpoint pins the tunnel to a custom edge endpoint ("host:port") and
+// reconnects the active account so the change takes effect.
 func (m *Manager) SetEndpoint(ctx context.Context, endpoint string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.endpoint = endpoint
-	for i := range m.workers {
-		if err := m.connectLocked(ctx, i, endpoint); err != nil {
-			return err
-		}
+	if err := m.connectLocked(ctx, m.active, endpoint); err != nil {
+		return err
 	}
 	m.last = time.Now()
 	return nil
 }
 
-// rotate advances the round-robin pointer and refreshes the abandoned
-// worker in the background, so the next dial lands on a ready tunnel while
-// the old one regains a fresh IP.
-func (m *Manager) rotate(ctx context.Context) error {
-	m.mu.RLock()
-	n := len(m.workers)
-	m.mu.RUnlock()
-	if n == 0 {
-		return ErrNotConnected
-	}
-	abandoned := int(m.rr.Add(1)) % n
-	m.last = time.Now()
-
-	go func() {
-		hctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-		defer cancel()
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		if m.mode == ModeReregister {
-			_ = m.reregisterLocked(hctx, abandoned)
-		} else {
-			_ = m.connectLocked(hctx, abandoned, m.endpoint)
-		}
-	}()
-	return nil
-}
-
-// Connected reports whether at least one tunnel is up.
+// Connected reports whether the active tunnel is up.
 func (m *Manager) Connected(_ context.Context) (bool, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	for _, w := range m.workers {
-		if w != nil && w.d != nil {
-			return true, nil
-		}
-	}
-	return false, nil
+	_, err := m.activeWorker()
+	return err == nil, nil
 }
 
 // Status returns a one-line tunnel state for the panel dashboard.
 func (m *Manager) Status(_ context.Context) (string, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	up := 0
-	for _, w := range m.workers {
-		if w != nil && w.d != nil {
-			up++
-		}
-	}
-	if up == 0 {
+	if m.activeWorkerLocked() == nil {
 		return "disconnected", nil
 	}
 	ep := m.endpoint
 	if ep == "" {
 		ep = "default edge"
 	}
-	if len(m.workers) == 1 {
+	if m.poolSize() == 1 {
 		return fmt.Sprintf("connected (MASQUE, endpoint %s)", ep), nil
 	}
-	return fmt.Sprintf("connected (MASQUE, %d/%d workers round-robin, endpoint %s)",
-		up, len(m.workers), ep), nil
+	return fmt.Sprintf("connected (MASQUE, account %d/%d, endpoint %s)",
+		m.active+1, m.poolSize(), ep), nil
 }
 
-// bringUpLocked ensures every configured account has a tunnel, keeping the
-// workers that are already up. It fails only when none could be started.
+// activeWorker returns the worker that owns the live tunnel.
+func (m *Manager) activeWorker() (*worker, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if w := m.activeWorkerLocked(); w != nil {
+		return w, nil
+	}
+	return nil, ErrNotConnected
+}
+
+// activeWorkerLocked is activeWorker without locking.
+func (m *Manager) activeWorkerLocked() *worker {
+	if m.active < len(m.workers) {
+		if w := m.workers[m.active]; w != nil && w.d != nil {
+			return w
+		}
+	}
+	// Any live tunnel counts: the active index can lag a failed rotation.
+	for _, w := range m.workers {
+		if w != nil && w.d != nil {
+			return w
+		}
+	}
+	return nil
+}
+
+// bringUpLocked ensures the active account has a tunnel. Other accounts
+// keep only their identity files; their tunnels open on rotation.
 func (m *Manager) bringUpLocked(ctx context.Context, endpoint string) error {
+	m.ensureWorkersLocked()
+	return m.connectLocked(ctx, m.active, endpoint)
+}
+
+// ensureWorkersLocked allocates the worker slots when missing, so a
+// Reconnect before EnsureReady cannot index an empty pool.
+func (m *Manager) ensureWorkersLocked() {
 	if len(m.workers) == 0 {
-		m.workers = make([]*worker, m.accounts)
+		m.workers = make([]*worker, m.poolSize())
 		for i := range m.workers {
 			m.workers[i] = &worker{index: i}
 		}
 	}
-	var firstErr error
-	raised := 0
-	for i, w := range m.workers {
-		if w.d != nil {
-			raised++
-			continue
-		}
-		if err := m.connectLocked(ctx, i, endpoint); err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		raised++
-		// Space fresh registrations out; the API rate-limits bursts.
-		if i+1 < len(m.workers) {
-			time.Sleep(time.Second)
-		}
-	}
-	if raised == 0 {
-		return firstErr
-	}
-	return nil
 }
 
 // connectLocked (re)establishes worker i's tunnel for its stored identity.
@@ -309,17 +266,6 @@ func (m *Manager) connectLocked(ctx context.Context, i int, endpoint string) err
 	}
 	m.swap(i, tun, d)
 	return nil
-}
-
-// ensureWorkersLocked allocates the worker slots when missing, so a
-// Reconnect before EnsureReady cannot index an empty pool.
-func (m *Manager) ensureWorkersLocked() {
-	if len(m.workers) == 0 {
-		m.workers = make([]*worker, m.accounts)
-		for i := range m.workers {
-			m.workers[i] = &worker{index: i}
-		}
-	}
 }
 
 // reregisterLocked deletes worker i's registration and starts over with a

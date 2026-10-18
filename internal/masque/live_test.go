@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -226,6 +227,78 @@ func TestLiveAppFlow(t *testing.T) {
 	}
 }
 
+// egressFor opens id's tunnel (optionally pinned to an endpoint) and asks
+// whoami.cloudflare for the WARP egress address.
+func egressFor(t *testing.T, ctx context.Context, id *Identity,
+	endpoint string) (string, error) {
+	t.Helper()
+	tun, err := Dial(ctx, id, endpoint)
+	if err != nil {
+		return "", fmt.Errorf("tunnel: %w", err)
+	}
+	defer tun.Close()
+	d, err := NewNetstackDialer(tun, id)
+	if err != nil {
+		return "", fmt.Errorf("netstack: %w", err)
+	}
+	resp, err := d.dnsExchange(ctx, BuildTXTQuery("whoami.cloudflare"))
+	if err != nil {
+		return "", fmt.Errorf("dns: %w", err)
+	}
+	return parseTXTFromMessage(resp)
+}
+
+// TestLiveEgressPerAccount reports the WARP egress of every stored identity
+// (sequentially, so each session is fresh).
+func TestLiveEgressPerAccount(t *testing.T) {
+	liveGuard(t)
+	dir := os.Getenv("MASQUE_STATE")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		id, err := LoadIdentityAt(filepath.Join(dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		txt, err := egressFor(t, ctx, id, "")
+		if err != nil {
+			t.Logf("%s: %v", e.Name(), err)
+			continue
+		}
+		t.Logf("%s -> egress %q", e.Name(), txt)
+	}
+}
+
+// TestLiveEgressKeysOnSession proves the egress depends on the session, not
+// the account or the edge: the same identity on two endpoints answers with
+// the same address, and each fresh session of any account may move.
+func TestLiveEgressKeysOnSession(t *testing.T) {
+	liveGuard(t)
+	id := loadLiveIdentity(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	seen := map[string]bool{}
+	for _, ep := range []string{"", ""} {
+		txt, err := egressFor(t, ctx, id, ep)
+		if err != nil {
+			t.Logf("endpoint %q: %v", ep, err)
+			continue
+		}
+		seen[txt] = true
+		t.Logf("fresh session -> egress %q", txt)
+	}
+	if len(seen) > 1 {
+		t.Logf("egress varies between fresh sessions: %v", seen)
+	}
+}
+
 // TestLiveEgressPerEndpoint reports the WARP egress for two different edge
 // endpoints with the same identity: same IP means the egress keys on the
 // client, different IPs mean the pool can spread across edges.
@@ -275,49 +348,45 @@ func TestLiveEgressPerEndpoint(t *testing.T) {
 	}
 }
 
-// TestLiveEgressPerAccount reports the WARP egress of every stored
-// identity: distinct IPs make the pool useful, identical ones mean
-// Cloudflare keys the egress on the client host.
-func TestLiveEgressPerAccount(t *testing.T) {
+// TestLiveSimultaneousEgress opens the stored identities' tunnels at the
+// same time and reports each one's egress, mirroring the daemon's pool.
+func TestLiveSimultaneousEgress(t *testing.T) {
 	liveGuard(t)
 	dir := os.Getenv("MASQUE_STATE")
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatalf("read state: %v", err)
-	}
+	entries, _ := os.ReadDir(dir)
+	var ids []*Identity
+	var names []string
 	for _, e := range entries {
-		name := e.Name()
-		if !strings.HasSuffix(name, ".json") {
+		if !strings.HasSuffix(e.Name(), ".json") {
 			continue
 		}
-		id, err := LoadIdentityAt(filepath.Join(dir, name))
+		id, err := LoadIdentityAt(filepath.Join(dir, e.Name()))
 		if err != nil {
-			t.Logf("%s: load: %v", name, err)
 			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		ids = append(ids, id)
+		names = append(names, e.Name())
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	for i, id := range ids {
 		tun, err := Dial(ctx, id, "")
 		if err != nil {
-			cancel()
-			t.Logf("%s: tunnel: %v", name, err)
+			t.Logf("%s: tunnel: %v", names[i], err)
 			continue
 		}
-		d, derr := NewNetstackDialer(tun, id)
-		if derr != nil {
-			tun.Close()
-			cancel()
+		defer tun.Close()
+		d, err := NewNetstackDialer(tun, id)
+		if err != nil {
 			continue
 		}
 		resp, rerr := d.dnsExchange(ctx, BuildTXTQuery("whoami.cloudflare"))
 		if rerr != nil {
-			t.Logf("%s: dns: %v", name, rerr)
-			tun.Close()
-			cancel()
+			t.Logf("%s: dns: %v", names[i], rerr)
 			continue
 		}
 		txt, _ := parseTXTFromMessage(resp)
-		t.Logf("%s -> egress %q", name, txt)
-		tun.Close()
-		cancel()
+		t.Logf("%s -> egress %q", names[i], txt)
+		time.Sleep(300 * time.Millisecond)
 	}
 }

@@ -162,68 +162,73 @@ func (fakeDialer) Resolve(context.Context, string) (net.IP, error) {
 	return nil, errors.New("fake dialer")
 }
 
-func TestPoolRoundRobinAndRotate(t *testing.T) {
+func TestPoolRotationUsesFreshSession(t *testing.T) {
 	dir := t.TempDir()
-	var attempts atomic.Int32
+	var attempts, oldClosed atomic.Int32
 	m := NewManager(dir, ModeReconnect, 3)
 	m.register = func(context.Context) (*masque.Identity, error) {
 		return testIdentity(), nil
 	}
-	m.connect = func(_ context.Context, _ *masque.Identity,
-		endpoint string) (Tunnel, Dialer, error) {
+	m.connect = func(context.Context, *masque.Identity,
+		string) (Tunnel, Dialer, error) {
 		attempts.Add(1)
-		return &countingTunnel{}, &fakeDialer{}, nil
+		return &countingTunnel{onClose: func() { oldClosed.Add(1) }}, &fakeDialer{}, nil
 	}
 
 	if err := m.EnsureReady(context.Background()); err != nil {
 		t.Fatalf("EnsureReady: %v", err)
 	}
-	// Three accounts, three tunnels.
-	if attempts.Load() != 3 {
-		t.Fatalf("connects = %d, want 3", attempts.Load())
-	}
-	// Two extra registrations must have been persisted per worker.
-	for _, name := range []string{"identity.json", "acc-1.json", "acc-2.json"} {
-		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
-			t.Errorf("state file %s missing: %v", name, err)
-		}
+	if attempts.Load() != 1 {
+		t.Fatalf("connects = %d, want 1 (only the active account)", attempts.Load())
 	}
 
-	// Reconnect in pool mode rotates: no new connects (the abandoned worker
-	// heals in the background), egress pointer moves.
-	before := attempts.Load()
+	// Rotation opens the next identity's fresh session and drops the old
+	// tunnel only afterwards.
 	if err := m.Reconnect(context.Background()); err != nil {
-		t.Fatalf("rotate: %v", err)
+		t.Fatalf("Reconnect: %v", err)
 	}
-	if got := attempts.Load(); got != before {
-		t.Errorf("rotate added %d connects synchronously, want 0", got-before)
+	if attempts.Load() != 2 || oldClosed.Load() != 1 {
+		t.Errorf("attempts=%d closed=%d, want 2/1", attempts.Load(), oldClosed.Load())
+	}
+	st, err := m.Status(context.Background())
+	if err != nil || !strings.Contains(st, "account 2/3") {
+		t.Errorf("status = %q, %v; want account 2/3", st, err)
 	}
 
-	// Status reports the pool.
-	st, err := m.Status(context.Background())
-	if err != nil || !strings.Contains(st, "3/3 workers") {
-		t.Errorf("status = %q, %v; want 3/3 workers", st, err)
+	// A second rotation wraps around to the first identity.
+	if err := m.Reconnect(context.Background()); err != nil {
+		t.Fatalf("Reconnect 2: %v", err)
+	}
+	if attempts.Load() != 3 {
+		t.Errorf("connects = %d, want 3", attempts.Load())
 	}
 }
 
-func TestPoolToleratesPartialFailure(t *testing.T) {
+func TestPoolKeepsOldTunnelOnFailedRotation(t *testing.T) {
 	dir := t.TempDir()
-	var attempts atomic.Int32
+	var attempts, oldClosed atomic.Int32
 	m := NewManager(dir, ModeReconnect, 2)
 	m.register = func(context.Context) (*masque.Identity, error) {
 		return testIdentity(), nil
 	}
-	m.connect = func(_ context.Context, _ *masque.Identity,
-		_ string) (Tunnel, Dialer, error) {
-		if attempts.Add(1) == 1 {
-			return nil, nil, errors.New("first worker fails")
+	m.connect = func(context.Context, *masque.Identity,
+		string) (Tunnel, Dialer, error) {
+		if attempts.Add(1) == 2 {
+			return nil, nil, errors.New("next identity's tunnel fails")
 		}
-		return &countingTunnel{}, &fakeDialer{}, nil
+		return &countingTunnel{onClose: func() { oldClosed.Add(1) }}, &fakeDialer{}, nil
 	}
 	if err := m.EnsureReady(context.Background()); err != nil {
 		t.Fatalf("EnsureReady: %v", err)
 	}
+	if err := m.Reconnect(context.Background()); err == nil {
+		t.Fatal("rotation succeeded although the next tunnel failed")
+	}
+	// The old tunnel must stay up.
 	if ok, _ := m.Connected(context.Background()); !ok {
-		t.Error("pool reported down despite one healthy worker")
+		t.Error("failed rotation tore down the working tunnel")
+	}
+	if oldClosed.Load() != 0 {
+		t.Error("failed rotation closed the old tunnel")
 	}
 }
