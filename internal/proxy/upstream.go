@@ -6,20 +6,20 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
-	"net/http"
-	"strings"
+	"strconv"
 	"time"
 )
 
-// Upstream dials target addresses through an HTTP CONNECT proxy
-// (the warp-cli proxy in proxy mode).
+// Upstream dials target addresses through a SOCKS5 proxy: the warp-cli
+// local proxy, whose native protocol is SOCKS5.
 type Upstream struct {
-	// Addr is the upstream HTTP proxy "host:port".
+	// Addr is the upstream SOCKS5 proxy "host:port".
 	Addr string
-	// Timeout bounds the CONNECT handshake. Zero means 30s.
+	// Timeout bounds the SOCKS5 handshake. Zero means 30s.
 	Timeout time.Duration
 }
 
@@ -31,8 +31,8 @@ func (u *Upstream) handshakeTimeout() time.Duration {
 	return 30 * time.Second
 }
 
-// Dial connects to addr through the upstream proxy and returns the live
-// connection. Only "tcp" is supported; any other network is an error.
+// Dial connects to addr through the upstream SOCKS5 proxy and returns the
+// live connection. Only "tcp" is supported; any other network is an error.
 func (u *Upstream) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
 	if network != "tcp" && network != "tcp4" && network != "tcp6" {
 		return nil, fmt.Errorf("upstream dial: unsupported network %q", network)
@@ -43,7 +43,7 @@ func (u *Upstream) Dial(ctx context.Context, network, addr string) (net.Conn, er
 	if err != nil {
 		return nil, fmt.Errorf("dial upstream %s: %w", u.Addr, err)
 	}
-	extra, err := u.sendConnect(ctx, conn, addr)
+	extra, err := u.handshake(conn, addr)
 	if err != nil {
 		conn.Close()
 		return nil, err
@@ -54,8 +54,114 @@ func (u *Upstream) Dial(ctx context.Context, network, addr string) (net.Conn, er
 	return conn, nil
 }
 
-// prefixConn replays bytes that the CONNECT handshake reader already
-// consumed from the socket before handing the connection to the caller.
+// handshake performs the SOCKS5 no-auth CONNECT handshake. Any bytes read
+// past the reply are returned so the caller can replay them.
+func (u *Upstream) handshake(conn net.Conn, target string) ([]byte, error) {
+	_ = conn.SetDeadline(time.Now().Add(u.handshakeTimeout()))
+	defer conn.SetDeadline(time.Time{})
+
+	host, portStr, err := net.SplitHostPort(target)
+	if err != nil {
+		return nil, fmt.Errorf("upstream target %q: %w", target, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return nil, fmt.Errorf("upstream target %q: bad port", target)
+	}
+
+	// Greeting: version 5, one method, no authentication.
+	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		return nil, fmt.Errorf("socks greeting to %s: %w", u.Addr, err)
+	}
+	greet := make([]byte, 2)
+	if _, err := io.ReadFull(conn, greet); err != nil {
+		return nil, fmt.Errorf("socks greeting read: %w", err)
+	}
+	if greet[0] != 0x05 || greet[1] != 0x00 {
+		return nil, fmt.Errorf("socks proxy %s rejected the no-auth method", u.Addr)
+	}
+
+	req, err := socksConnectRequest(host, port)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := conn.Write(req); err != nil {
+		return nil, fmt.Errorf("socks connect to %s: %w", target, err)
+	}
+
+	br := bufio.NewReader(conn)
+	if err := readSocksReply(br); err != nil {
+		return nil, err
+	}
+	if n := br.Buffered(); n > 0 {
+		buf := make([]byte, n)
+		if _, err := io.ReadFull(br, buf); err != nil {
+			return nil, fmt.Errorf("read buffered bytes: %w", err)
+		}
+		return buf, nil
+	}
+	return nil, nil
+}
+
+// socksConnectRequest builds a SOCKS5 CONNECT request. Hostnames travel as
+// domain names so the upstream resolves them; IP literals travel as such.
+func socksConnectRequest(host string, port int) ([]byte, error) {
+	head := []byte{0x05, 0x01, 0x00} // VER, CMD=CONNECT, RSV
+	if ip := net.ParseIP(host); ip != nil {
+		if v4 := ip.To4(); v4 != nil {
+			req := append(head, 0x01) // ATYP=IPv4
+			req = append(req, v4...)
+			return append(req, byte(port>>8), byte(port)), nil
+		}
+		req := append(head, 0x04) // ATYP=IPv6
+		req = append(req, ip.To16()...)
+		return append(req, byte(port>>8), byte(port)), nil
+	}
+	if len(host) > 255 {
+		return nil, errors.New("upstream target hostname too long")
+	}
+	req := append(head, 0x03, byte(len(host))) // ATYP=domain
+	req = append(req, host...)
+	return append(req, byte(port>>8), byte(port)), nil
+}
+
+// readSocksReply reads the CONNECT reply and skips the bound address.
+func readSocksReply(br *bufio.Reader) error {
+	head := make([]byte, 4)
+	if _, err := io.ReadFull(br, head); err != nil {
+		return fmt.Errorf("socks reply read: %w", err)
+	}
+	if head[0] != 0x05 {
+		return fmt.Errorf("socks reply: bad version %d", head[0])
+	}
+	if head[1] != 0x00 {
+		return fmt.Errorf("socks proxy refused CONNECT: reply code %d", head[1])
+	}
+	switch head[3] {
+	case 0x01: // IPv4
+		if _, err := io.CopyN(io.Discard, br, 4+2); err != nil {
+			return fmt.Errorf("socks reply bind addr: %w", err)
+		}
+	case 0x03: // domain
+		lenBuf := make([]byte, 1)
+		if _, err := io.ReadFull(br, lenBuf); err != nil {
+			return fmt.Errorf("socks reply bind addr: %w", err)
+		}
+		if _, err := io.CopyN(io.Discard, br, int64(lenBuf[0])+2); err != nil {
+			return fmt.Errorf("socks reply bind addr: %w", err)
+		}
+	case 0x04: // IPv6
+		if _, err := io.CopyN(io.Discard, br, 16+2); err != nil {
+			return fmt.Errorf("socks reply bind addr: %w", err)
+		}
+	default:
+		return fmt.Errorf("socks reply: bad address type %d", head[3])
+	}
+	return nil
+}
+
+// prefixConn replays bytes that the handshake reader already consumed from
+// the socket before handing the connection to the caller.
 type prefixConn struct {
 	net.Conn
 	prefix []byte
@@ -68,38 +174,4 @@ func (c *prefixConn) Read(p []byte) (int, error) {
 		return n, nil
 	}
 	return c.Conn.Read(p)
-}
-
-// sendConnect performs the HTTP CONNECT handshake on conn. Any bytes the
-// response reader already buffered are returned so the caller can replay
-// them to its peer.
-func (u *Upstream) sendConnect(_ context.Context, conn net.Conn, target string) ([]byte, error) {
-	deadline := time.Now().Add(u.handshakeTimeout())
-	_ = conn.SetDeadline(deadline)
-	defer conn.SetDeadline(time.Time{})
-
-	probe := &http.Request{Method: http.MethodConnect}
-	reqLine := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target)
-	if _, err := conn.Write([]byte(reqLine)); err != nil {
-		return nil, fmt.Errorf("send CONNECT %s: %w", target, err)
-	}
-
-	br := bufio.NewReader(conn)
-	resp, err := http.ReadResponse(br, probe)
-	if err != nil {
-		return nil, fmt.Errorf("read CONNECT response for %s: %w", target, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("upstream refused CONNECT to %s: %s",
-			target, strings.TrimSpace(resp.Status))
-	}
-	if n := br.Buffered(); n > 0 {
-		buf := make([]byte, n)
-		if _, err := io.ReadFull(br, buf); err != nil {
-			return nil, fmt.Errorf("read buffered bytes: %w", err)
-		}
-		return buf, nil
-	}
-	return nil, nil
 }

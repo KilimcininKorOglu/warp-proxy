@@ -2,11 +2,12 @@ package health
 
 import (
 	"bufio"
+	"encoding/binary"
 	"io"
 	"log/slog"
 	"net"
-	"net/http"
 	"os"
+	"strconv"
 	"testing"
 )
 
@@ -41,19 +42,57 @@ func fakeUpstream(t *testing.T) string {
 
 func handleConnect(conn net.Conn) {
 	defer conn.Close()
-	req, err := http.ReadRequest(bufio.NewReader(conn))
-	if err != nil || req.Method != http.MethodConnect {
+	br := bufio.NewReader(conn)
+	head := make([]byte, 2)
+	if _, err := io.ReadFull(br, head); err != nil || head[0] != 5 {
 		return
 	}
-	target, err := net.Dial("tcp", req.Host)
+	methods := make([]byte, head[1])
+	if _, err := io.ReadFull(br, methods); err != nil {
+		return
+	}
+	if _, err := conn.Write([]byte{5, 0}); err != nil {
+		return
+	}
+	req := make([]byte, 4)
+	if _, err := io.ReadFull(br, req); err != nil || req[1] != 1 {
+		return
+	}
+	var host string
+	switch req[3] {
+	case 1:
+		ip := make([]byte, 4)
+		if _, err := io.ReadFull(br, ip); err != nil {
+			return
+		}
+		host = net.IP(ip).String()
+	case 3:
+		l := make([]byte, 1)
+		if _, err := io.ReadFull(br, l); err != nil {
+			return
+		}
+		name := make([]byte, l[0])
+		if _, err := io.ReadFull(br, name); err != nil {
+			return
+		}
+		host = string(name)
+	default:
+		return
+	}
+	port := make([]byte, 2)
+	if _, err := io.ReadFull(br, port); err != nil {
+		return
+	}
+	p := binary.BigEndian.Uint16(port)
+	target, err := net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(int(p))))
 	if err != nil {
-		io.WriteString(conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
+		conn.Write([]byte{5, 4, 0, 1, 0, 0, 0, 0, 0, 0})
 		return
 	}
 	defer target.Close()
-	io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
+	conn.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
 	done := make(chan struct{}, 2)
-	go func() { io.Copy(target, conn); done <- struct{}{} }()
+	go func() { io.Copy(target, br); done <- struct{}{} }()
 	go func() { io.Copy(conn, target); done <- struct{}{} }()
 	<-done
 }

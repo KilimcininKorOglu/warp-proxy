@@ -3,11 +3,13 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -15,7 +17,7 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-// fakeUpstream is a minimal HTTP CONNECT proxy standing in for warp-cli.
+// fakeUpstream is a minimal SOCKS5 proxy standing in for warp-cli.
 type fakeUpstream struct{ ln net.Listener }
 
 func newFakeUpstream(t *testing.T) *fakeUpstream {
@@ -43,21 +45,61 @@ func (f *fakeUpstream) serve() {
 func (f *fakeUpstream) handle(conn net.Conn) {
 	defer conn.Close()
 	br := bufio.NewReader(conn)
-	req, err := http.ReadRequest(br)
-	if err != nil {
+	// Greeting: VER, NMETHODS, METHODS.
+	head := make([]byte, 2)
+	if _, err := io.ReadFull(br, head); err != nil || head[0] != 5 {
 		return
 	}
-	if req.Method != http.MethodConnect {
-		io.WriteString(conn, "HTTP/1.1 405 Method Not Allowed\r\n\r\n")
+	methods := make([]byte, head[1])
+	if _, err := io.ReadFull(br, methods); err != nil {
 		return
 	}
-	target, err := net.Dial("tcp", req.Host)
+	if _, err := conn.Write([]byte{5, 0}); err != nil {
+		return
+	}
+	// Request: VER CMD RSV ATYP ADDR PORT.
+	req := make([]byte, 4)
+	if _, err := io.ReadFull(br, req); err != nil || req[1] != 1 {
+		return
+	}
+	var host string
+	switch req[3] {
+	case 1:
+		ip := make([]byte, 4)
+		if _, err := io.ReadFull(br, ip); err != nil {
+			return
+		}
+		host = net.IP(ip).String()
+	case 3:
+		l := make([]byte, 1)
+		if _, err := io.ReadFull(br, l); err != nil {
+			return
+		}
+		name := make([]byte, l[0])
+		if _, err := io.ReadFull(br, name); err != nil {
+			return
+		}
+		host = string(name)
+	case 4:
+		ip := make([]byte, 16)
+		if _, err := io.ReadFull(br, ip); err != nil {
+			return
+		}
+		host = net.IP(ip).String()
+	default:
+		return
+	}
+	port := make([]byte, 2)
+	if _, err := io.ReadFull(br, port); err != nil {
+		return
+	}
+	target, err := net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(int(binary.BigEndian.Uint16(port)))))
 	if err != nil {
-		io.WriteString(conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
+		conn.Write([]byte{5, 4, 0, 1, 0, 0, 0, 0, 0, 0}) // host unreachable
 		return
 	}
 	defer target.Close()
-	io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
+	conn.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}) // success
 	done := make(chan struct{}, 2)
 	go func() { io.Copy(target, br); done <- struct{}{} }()
 	go func() { io.Copy(conn, target); done <- struct{}{} }()
@@ -175,8 +217,8 @@ func TestSOCKSProxyThroughUpstream(t *testing.T) {
 }
 
 func TestUpstreamRefusedConnectReturnsError(t *testing.T) {
-	// A listener that answers 403 to every CONNECT stands in for an
-	// upstream that refuses the tunnel.
+	// A listener that accepts the greeting but rejects every method stands
+	// in for an upstream that refuses the tunnel.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -188,7 +230,9 @@ func TestUpstreamRefusedConnectReturnsError(t *testing.T) {
 			if err != nil {
 				return
 			}
-			io.WriteString(conn, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+			buf := make([]byte, 64)
+			conn.Read(buf)
+			conn.Write([]byte{5, 0xFF}) // no acceptable methods
 			conn.Close()
 		}
 	}()
