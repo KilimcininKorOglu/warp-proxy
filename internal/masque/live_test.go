@@ -1,6 +1,7 @@
 package masque
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"net"
@@ -96,4 +97,53 @@ func TestLiveEndpointScan(t *testing.T) {
 	tc := nc.(*tls.Conn)
 	st := tc.ConnectionState()
 	t.Logf("tcp+tls handshake OK: tls=0x%x alpn=%q", st.Version, st.NegotiatedProtocol)
+}
+
+// TestLiveNetstack dials real TCP through tunnel + netstack: remote DNS
+// resolution and an HTTP GET must return data.
+func TestLiveNetstack(t *testing.T) {
+	liveGuard(t)
+	id := loadLiveIdentity(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	tun, err := Dial(ctx, id, "")
+	if err != nil {
+		t.Fatalf("tunnel: %v", err)
+	}
+	defer tun.Close()
+	d, err := NewNetstackDialer(tun, id)
+	if err != nil {
+		t.Fatalf("netstack: %v", err)
+	}
+	ip, err := d.Resolve(ctx, "cloudflare.com")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	t.Logf("resolved cloudflare.com -> %s", ip)
+	conn, err := d.Dial(ctx, "tcp", "cloudflare.com:80")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	req := "GET / HTTP/1.1\r\nHost: cloudflare.com\r\nConnection: close\r\n\r\n"
+	if _, err := conn.Write([]byte(req)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+	buf := make([]byte, 256)
+	n, err := conn.Read(buf)
+	if err != nil && n == 0 {
+		t.Fatalf("read: %v", err)
+	}
+	t.Logf("read %d bytes: %q", n, buf[:min(n, 60)])
+	if !bytes.HasPrefix(buf[:n], []byte("HTTP/1.1")) {
+		t.Errorf("answer %q is not HTTP", buf[:min(n, 60)])
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
