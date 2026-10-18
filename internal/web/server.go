@@ -200,7 +200,7 @@ func (s *Server) doReconnect(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) showSettings(w http.ResponseWriter, _ *http.Request) {
 	s.render(w, "settings.html", map[string]any{
-		"Cfg": s.GetConfig(),
+		"Cfg":   s.GetConfig(),
 		"Saved": false,
 	})
 }
@@ -245,6 +245,9 @@ func applyForm(cfg *config.Config, r *http.Request) {
 	cfg.Reconnect.MinInterval = formOr(r, "min_interval", cfg.Reconnect.MinInterval)
 	cfg.Reconnect.CooldownAfterBurst = formOr(r, "cooldown", cfg.Reconnect.CooldownAfterBurst)
 	cfg.Reconnect.MaxConsecutive = formIntOr(r, "max_consecutive", cfg.Reconnect.MaxConsecutive)
+	cfg.Front.Enabled = r.FormValue("front_enabled") == "on"
+	cfg.Front.Domains = splitLines(r.FormValue("front_domains"))
+	cfg.Front.ResolveCacheTTL = formOr(r, "front_cache_ttl", cfg.Front.ResolveCacheTTL)
 }
 
 func formOr(r *http.Request, key, fallback string) string {

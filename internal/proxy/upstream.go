@@ -21,6 +21,11 @@ type Upstream struct {
 	Addr string
 	// Timeout bounds the SOCKS5 handshake. Zero means 30s.
 	Timeout time.Duration
+	// Front, when set, may rewrite "host:port" to a Cloudflare front
+	// edge IP before the SOCKS5 CONNECT. It receives the context and the
+	// original address and returns the address to dial plus whether it
+	// changed anything.
+	Front func(ctx context.Context, hostPort string) (string, bool)
 }
 
 // handshakeTimeout returns the configured or default handshake timeout.
@@ -38,12 +43,19 @@ func (u *Upstream) Dial(ctx context.Context, network, addr string) (net.Conn, er
 		return nil, fmt.Errorf("upstream dial: unsupported network %q", network)
 	}
 
+	connectAddr := addr
+	if u.Front != nil {
+		if rewritten, changed := u.Front(ctx, addr); changed {
+			connectAddr = rewritten
+		}
+	}
+
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "tcp", u.Addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial upstream %s: %w", u.Addr, err)
 	}
-	extra, err := u.handshake(conn, addr)
+	extra, err := u.handshake(conn, connectAddr)
 	if err != nil {
 		conn.Close()
 		return nil, err

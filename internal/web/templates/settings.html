@@ -30,6 +30,14 @@
     <tr><th>Min reconnect aralığı</th><td><input type="text" name="min_interval" value="{{.Cfg.Reconnect.MinInterval}}"></td></tr>
     <tr><th>Üst üste reconnect sınırı</th><td><input type="text" name="max_consecutive" value="{{.Cfg.Reconnect.MaxConsecutive}}"></td></tr>
     <tr><th>Cooldown</th><td><input type="text" name="cooldown" value="{{.Cfg.Reconnect.CooldownAfterBurst}}"></td></tr>
+    <tr><th>Front IP</th>
+      <td><label><input type="checkbox" name="front_enabled" {{if .Cfg.Front.Enabled}}checked{{end}} style="width:auto"> açık</label>
+      <div class="muted">Cloudflare-fronted hedefleri Clean-IP taramasının en hızlı IP'lerinden bağlar. Havuz boşken etkisizdir.</div></td></tr>
+    <tr><th>Front domain listesi</th>
+      <td><textarea name="front_domains">{{range .Cfg.Front.Domains}}{{.}}
+{{end}}</textarea>
+      <div class="muted">Her satır bir suffix. Bu listedeki hedefler CF tespitinden bağımsız olarak front IP'den bağlanır.</div></td></tr>
+    <tr><th>Front cache TTL</th><td><input type="text" name="front_cache_ttl" value="{{.Cfg.Front.ResolveCacheTTL}}"></td></tr>
   </table>
   <p><button type="submit">Kaydet</button></p>
   </form>

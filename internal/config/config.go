@@ -22,7 +22,16 @@ type Config struct {
 	Health    HealthConfig    `yaml:"health"`
 	Reconnect ReconnectConfig `yaml:"reconnect"`
 	CleanIP   CleanIPConfig   `yaml:"cleanip"`
+	Front     FrontConfig     `yaml:"front"`
 	Auth      AuthConfig      `yaml:"auth"`
+}
+
+// FrontConfig configures Cloudflare front-IP rewriting for proxied
+// traffic.
+type FrontConfig struct {
+	Enabled         bool     `yaml:"enabled"`
+	Domains         []string `yaml:"domains"`
+	ResolveCacheTTL string   `yaml:"resolve_cache_ttl"`
 }
 
 // CleanIPConfig configures the Cloudflare edge latency scanner.
@@ -61,10 +70,10 @@ type WarpConfig struct {
 
 // HealthConfig configures the periodic health check through the WARP proxy.
 type HealthConfig struct {
-	Enabled  bool     `yaml:"enabled"`
-	Interval string   `yaml:"interval"`
-	Timeout  string   `yaml:"timeout"`
-	URL      string   `yaml:"url"`
+	Enabled  bool   `yaml:"enabled"`
+	Interval string `yaml:"interval"`
+	Timeout  string `yaml:"timeout"`
+	URL      string `yaml:"url"`
 	// TraceURL is fetched through the proxy to read the exit IP and the
 	// warp=on flag. Empty disables the IP readout.
 	TraceURL   string   `yaml:"trace_url"`
@@ -73,9 +82,9 @@ type HealthConfig struct {
 
 // ReconnectConfig rate-limits automatic and manual reconnects.
 type ReconnectConfig struct {
-	MinInterval         string `yaml:"min_interval"`
-	MaxConsecutive      int    `yaml:"max_consecutive"`
-	CooldownAfterBurst  string `yaml:"cooldown_after_burst"`
+	MinInterval        string `yaml:"min_interval"`
+	MaxConsecutive     int    `yaml:"max_consecutive"`
+	CooldownAfterBurst string `yaml:"cooldown_after_burst"`
 }
 
 // AuthConfig holds the panel credentials.
@@ -120,6 +129,10 @@ func Defaults() *Config {
 			Workers:         50,
 			Timeout:         "2s",
 			Top:             20,
+		},
+		Front: FrontConfig{
+			Enabled:         false,
+			ResolveCacheTTL: "10m",
 		},
 		Auth: AuthConfig{Username: "admin"},
 	}

@@ -37,6 +37,12 @@ browser --> :8590 panel       --/
   the server to candidate Cloudflare edge IPs (official ips-v4 list), ranks
   the fastest, and can pin one as the WARP tunnel endpoint
   (`warp-cli tunnel endpoint set` plus a rate-limited reconnect).
+- `internal/front` rewrites Cloudflare-fronted targets to those fastest
+  edge IPs ("front IPs"). A host qualifies through the panel's domain
+  suffix list or automatic detection that it resolves inside Cloudflare's
+  ranges; decisions are cached per host. TLS SNI is untouched, so only
+  Cloudflare-fronted sites are rewritten and the pool stays empty until a
+  Clean-IP scan has run.
 
 ## Run
 

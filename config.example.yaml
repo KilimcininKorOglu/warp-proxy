@@ -43,6 +43,13 @@ cleanip:
   timeout: "2s"
   top: 20
 
+# Front IP rewriting: connect Cloudflare-fronted targets through the
+# fastest scanned edge IPs. Needs a Clean-IP scan to fill the pool.
+front:
+  enabled: false
+  domains: []            # extra suffixes always fronted, e.g. ["example.com"]
+  resolve_cache_ttl: "10m"
+
 # Panel login. The password is written on first start from the
 # WARP_PROXY_PASSWORD environment variable; only the bcrypt hash is stored.
 auth:
