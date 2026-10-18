@@ -252,7 +252,7 @@ func formIntOr(r *http.Request, key string, fallback int) int {
 
 func splitLines(v string) []string {
 	var out []string
-	for _, line := range strings.Split(v, "\n") {
+	for line := range strings.SplitSeq(v, "\n") {
 		line = strings.TrimSpace(line)
 		if line != "" {
 			out = append(out, line)
