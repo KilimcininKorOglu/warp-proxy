@@ -29,15 +29,15 @@ type Config struct {
 
 // Status is the panel-visible health state.
 type Status struct {
-	Enabled       bool          `json:"enabled"`
-	Healthy       bool          `json:"healthy"`
-	ExitIP        string        `json:"exit_ip"`
-	WarpOn        bool          `json:"warp_on"`
-	LastRun       time.Time     `json:"last_run"`
-	LastError     string        `json:"last_error"`
-	LastFlagAt    time.Time     `json:"last_flag_at"`
-	LastReconnect time.Time     `json:"last_reconnect"`
-	Limiter       LimiterState  `json:"limiter"`
+	Enabled       bool         `json:"enabled"`
+	Healthy       bool         `json:"healthy"`
+	ExitIP        string       `json:"exit_ip"`
+	WarpOn        bool         `json:"warp_on"`
+	LastRun       time.Time    `json:"last_run"`
+	LastError     string       `json:"last_error"`
+	LastFlagAt    time.Time    `json:"last_flag_at"`
+	LastReconnect time.Time    `json:"last_reconnect"`
+	Limiter       LimiterState `json:"limiter"`
 }
 
 // Checker runs the periodic health check and triggers rate-limited
