@@ -27,12 +27,15 @@ type Config struct {
 	Auth      AuthConfig      `yaml:"auth"`
 }
 
-// BridgeConfig configures the OpenAI-compatible AI bridge listener that
-// replays requests after a WARP rotation on retryable upstream statuses.
+// BridgeConfig configures the OpenAI-compatible AI bridge listener. A
+// configured retry status is replayed: a 429 whose body is a
+// FreeUsageLimitError rotates the WARP exit IP first, while any other
+// retryable status is retried on the same IP after Retry-After.
 type BridgeConfig struct {
-	Enabled       bool   `yaml:"enabled"`
-	Listen        string `yaml:"listen"`
-	Upstream      string `yaml:"upstream"`
+	Enabled  bool   `yaml:"enabled"`
+	Listen   string `yaml:"listen"`
+	Upstream string `yaml:"upstream"`
+	// RetryStatuses lists the upstream status codes eligible for a replay.
 	RetryStatuses []int  `yaml:"retry_statuses"`
 	RetryAttempts int    `yaml:"retry_attempts"`
 	MaxConcurrent int    `yaml:"max_concurrent"`

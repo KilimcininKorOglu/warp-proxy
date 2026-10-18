@@ -46,9 +46,10 @@ browser --> :8590 panel
   Clean-IP scan has run.
 - `internal/bridge` is the AI bridge: an OpenAI-compatible reverse proxy on
   :8593 that forwards requests to the configured upstream through WARP.
-  When the upstream answers with a retryable status (429 by default), it
-  rotates the WARP exit IP and replays the request once, honoring
-  `Retry-After`. Requests are forwarded unchanged, except for the OpenCode
+  A retryable status (429 by default) is replayed: a 429 whose body is a
+  `FreeUsageLimitError` rotates the WARP exit IP first, while any other
+  retryable answer is retried on the same IP after `Retry-After` (5 s when
+  absent). Requests are forwarded unchanged, except for the OpenCode
   free-tier identity (`bridge.inject_session`, on by default): the bridge
   adds the `X-Opencode-Session` and `X-Opencode-Request` headers, an
   opencode `User-Agent` and stub tool entries when the client did not
@@ -74,8 +75,9 @@ Point the free `opencode` provider at the bridge by merging one key into
 
 `HOST` is the machine running warp-proxy. The bridge forwards everything to
 `bridge.upstream` (`https://opencode.ai/zen` by default) through WARP; when
-the free tier rate-limits the exit IP with a 429, the bridge rotates WARP
-and replays automatically (rate-limited, `bridge.retry_attempts`). Any
+the free tier answers a 429 with a `FreeUsageLimitError`, the bridge rotates
+WARP and replays automatically (rate-limited, `bridge.retry_attempts`). Any
+other retryable status is retried on the same IP after `Retry-After`. Any
 OpenAI-compatible client works the same way: set its base URL to
 `http://HOST:8593/v1`. The upstream, retry statuses and limits are editable
 in the panel's settings page.
@@ -95,9 +97,9 @@ carry them:
   requires at least two)
 
 Values sent by the client are respected and never overwritten on the first
-attempt. When a retryable status rotates the WARP IP, the bridge can also
-refresh the session and request ids so the replay carries a fresh identity
-(`rotate_session_on_retry`, on by default): this overrides even a
+attempt. When a `FreeUsageLimitError` rotates the WARP IP, the bridge can
+also refresh the session and request ids so the replay carries a fresh
+identity (`rotate_session_on_retry`, on by default): this overrides even a
 client-provided session, trading the replayed request's prompt-cache affinity
 for a new session bucket. Toggle the whole feature off with
 `inject_session: false` in the config or the panel.

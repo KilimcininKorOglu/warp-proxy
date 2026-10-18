@@ -51,9 +51,10 @@ front:
   resolve_cache_ttl: "10m"
 
 # AI bridge: an OpenAI-compatible reverse proxy that forwards requests to
-# the upstream through WARP and replays after a WARP IP rotation when the
-# upstream answers with a retryable status (429). Point the AI client's
-# baseURL at http://<host>:8593/v1.
+# the upstream through WARP. A retryable status is replayed: only a 429 whose
+# body is a FreeUsageLimitError rotates the WARP exit IP first, while any
+# other retryable status is retried on the same IP after Retry-After (5 s when
+# absent). Point the AI client's baseURL at http://<host>:8593/v1.
 bridge:
   enabled: true
   listen: ":8593"

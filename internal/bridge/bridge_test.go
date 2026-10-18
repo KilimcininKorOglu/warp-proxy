@@ -24,23 +24,45 @@ func TestRetryAfterParsing(t *testing.T) {
 		}
 		return r
 	}
-	if d := retryAfter(mk("3"), time.Now()); d != 3*time.Second {
-		t.Errorf("seconds parse = %v, want 3s", d)
+	if d, ok := retryAfter(mk("3"), time.Now()); !ok || d != 3*time.Second {
+		t.Errorf("seconds parse = %v ok=%v, want 3s", d, ok)
 	}
-	if d := retryAfter(mk("9999"), time.Now()); d != maxRetryWait {
-		t.Errorf("cap = %v, want %v", d, maxRetryWait)
+	if d, ok := retryAfter(mk("9999"), time.Now()); !ok || d != maxRetryWait {
+		t.Errorf("cap = %v ok=%v, want %v", d, ok, maxRetryWait)
 	}
-	if d := retryAfter(mk("-5"), time.Now()); d != 0 {
-		t.Errorf("negative = %v, want 0", d)
+	if d, ok := retryAfter(mk("-5"), time.Now()); !ok || d != 0 {
+		t.Errorf("negative = %v ok=%v, want 0", d, ok)
 	}
-	if d := retryAfter(mk(time.Now().Add(2*time.Second).UTC().Format(http.TimeFormat)), time.Now()); d <= 0 || d > maxRetryWait {
-		t.Errorf("date parse = %v", d)
+	if d, ok := retryAfter(mk(time.Now().Add(2*time.Second).UTC().Format(http.TimeFormat)), time.Now()); !ok || d <= 0 || d > maxRetryWait {
+		t.Errorf("date parse = %v ok=%v", d, ok)
 	}
-	if d := retryAfter(mk(""), time.Now()); d != 0 {
-		t.Errorf("missing header = %v, want 0", d)
+	if _, ok := retryAfter(mk(""), time.Now()); ok {
+		t.Error("missing header reported parsable")
 	}
-	if d := retryAfter(mk("garbage"), time.Now()); d != 0 {
-		t.Errorf("garbage = %v, want 0", d)
+	if _, ok := retryAfter(mk("garbage"), time.Now()); ok {
+		t.Error("garbage header reported parsable")
+	}
+}
+
+func TestRetryWait(t *testing.T) {
+	mk := func(v string) *http.Response {
+		r := &http.Response{Header: http.Header{}}
+		if v != "" {
+			r.Header.Set("Retry-After", v)
+		}
+		return r
+	}
+	if d := retryWait(mk("0"), time.Now()); d != 0 {
+		t.Errorf("explicit zero = %v, want 0 (no default)", d)
+	}
+	if d := retryWait(mk("3"), time.Now()); d != 3*time.Second {
+		t.Errorf("hint = %v, want 3s", d)
+	}
+	if d := retryWait(mk(""), time.Now()); d != defaultRetryWait {
+		t.Errorf("missing hint = %v, want %v", d, defaultRetryWait)
+	}
+	if d := retryWait(mk("garbage"), time.Now()); d != defaultRetryWait {
+		t.Errorf("garbage hint = %v, want %v", d, defaultRetryWait)
 	}
 }
 
@@ -132,7 +154,7 @@ func TestForwardsAndPreservesHeaders(t *testing.T) {
 	}
 }
 
-func TestReplaysWithRotationOn429(t *testing.T) {
+func TestReplaysWithRotationOnUsageLimit(t *testing.T) {
 	var calls atomic.Int32
 	var sawFirstBody, sawReplayBody atomic.Bool
 	rotations := &atomic.Int32{}
@@ -143,7 +165,7 @@ func TestReplaysWithRotationOn429(t *testing.T) {
 			sawFirstBody.Store(string(body) == `{"prompt":"hi"}`)
 			w.Header().Set("Retry-After", "0")
 			w.WriteHeader(429)
-			io.WriteString(w, `{"error":"FreeUsageLimitError"}`)
+			io.WriteString(w, `{"error":{"type":"FreeUsageLimitError"}}`)
 			return
 		}
 		sawReplayBody.Store(string(body) == `{"prompt":"hi"}`)
@@ -201,6 +223,8 @@ func TestGivesUpAfterAttempts(t *testing.T) {
 	rotations := &atomic.Int32{}
 	bridge := fixture(t, func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
+		// A plain 429 is retried on the same IP, so it must not rotate.
+		w.Header().Set("Retry-After", "0")
 		w.WriteHeader(429)
 	}, rotations)
 
@@ -216,8 +240,35 @@ func TestGivesUpAfterAttempts(t *testing.T) {
 	if calls.Load() != 2 {
 		t.Errorf("upstream calls = %d, want 2", calls.Load())
 	}
-	if rotations.Load() != 1 {
-		t.Errorf("rotations = %d, want 1", rotations.Load())
+	if rotations.Load() != 0 {
+		t.Errorf("rotations = %d, want 0 (a plain 429 does not rotate)", rotations.Load())
+	}
+}
+
+func TestPlain429RetriesWithoutRotation(t *testing.T) {
+	var calls atomic.Int32
+	rotations := &atomic.Int32{}
+	bridge := fixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(429)
+			io.WriteString(w, `{"error":{"type":"RateLimitError"}}`)
+			return
+		}
+		io.WriteString(w, `{"ok":true}`)
+	}, rotations)
+
+	resp, err := http.Get(bridge.URL + "/v1/models")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 || string(respBody) != `{"ok":true}` {
+		t.Errorf("status=%d body=%q, want 200/ok", resp.StatusCode, respBody)
+	}
+	if calls.Load() != 2 || rotations.Load() != 0 {
+		t.Errorf("calls=%d rotations=%d, want 2/0", calls.Load(), rotations.Load())
 	}
 }
 

@@ -40,7 +40,7 @@
     <tr><th>Front cache TTL</th><td><input type="text" name="front_cache_ttl" value="{{.Cfg.Front.ResolveCacheTTL}}"></td></tr>
     <tr><th>AI bridge</th>
       <td><label><input type="checkbox" name="bridge_enabled" {{if .Cfg.Bridge.Enabled}}checked{{end}} style="width:auto"> açık</label>
-      <div class="muted">OpenAI-uyumlu reverse proxy: upstream 429 dönerse WARP IP'sini çevirip isteği tekrar eder. İstekler olduğu gibi iletilir; yalnız free-tier kimlik enjeksiyonu açıkken header eklenir.</div></td></tr>
+      <div class="muted">OpenAI-uyumlu reverse proxy: retry statusü dönerse isteği tekrar eder; yalnız gövdesi FreeUsageLimitError olan 429'da WARP IP'sini çevirir, diğerlerinde Retry-After kadar bekleyip aynı IP'den yineler. İstekler olduğu gibi iletilir; yalnız free-tier kimlik enjeksiyonu açıkken header eklenir.</div></td></tr>
     <tr><th>Free-tier enjeksiyonu</th>
       <td><label><input type="checkbox" name="bridge_inject_session" {{if .Cfg.Bridge.InjectSession}}checked{{end}} style="width:auto"> açık</label>
       <div class="muted">Her upstream isteğine X-Opencode-Session, X-Opencode-Request, opencode User-Agent ve eksik tool stub'larını ekler. İstemcinin gönderdiği değerler korunur.</div></td></tr>

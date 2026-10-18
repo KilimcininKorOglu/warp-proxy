@@ -1,7 +1,8 @@
 // Package bridge exposes an OpenAI-compatible reverse proxy that forwards
-// requests to a configured upstream through WARP and replays a request
-// after a WARP IP rotation when the upstream answers with a retryable
-// status such as 429. Requests are forwarded unchanged, except for the
+// requests to a configured upstream through WARP. A retryable status is
+// replayed: a 429 whose body is a FreeUsageLimitError rotates the WARP exit
+// IP first, while any other retryable answer is retried on the same IP after
+// the Retry-After hint. Requests are forwarded unchanged, except for the
 // OpenCode free-tier identity (session/request headers, User-Agent and tool
 // stubs) which is added when session injection is on and the client did not
 // provide it.
@@ -10,6 +11,7 @@ package bridge
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -31,6 +33,14 @@ const maxBody = 10 << 20 // 10 MB
 
 // maxRetryWait caps how long a Retry-After can make the bridge wait.
 const maxRetryWait = 60 * time.Second
+
+// defaultRetryWait is the wait before a non-rotating replay when the upstream
+// sends no parsable Retry-After hint.
+const defaultRetryWait = 5 * time.Second
+
+// maxErrorPeek bounds how much of a retryable response body is buffered to
+// classify it.
+const maxErrorPeek = 64 << 10 // 64 KB
 
 // Server is the bridge HTTP server.
 type Server struct {
@@ -91,10 +101,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !retryable(cfg, resp.StatusCode) || attempt == attempts {
 			break
 		}
-		s.note("warn", "upstream %d on %s, rotating WARP for replay",
-			resp.StatusCode, r.URL.Path)
 
-		if err := s.prepareReplay(r.Context(), resp, cfg, ids); err != nil {
+		if err := s.prepareReplay(r, resp, cfg, ids); err != nil {
 			if errors.Is(err, errClientCanceled) {
 				http.Error(w, "client canceled while waiting for retry", http.StatusBadGateway)
 				return
@@ -115,22 +123,37 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // out a Retry-After before replaying.
 var errClientCanceled = errors.New("client canceled while waiting for retry")
 
-// prepareReplay honors Retry-After on resp, rotates the WARP exit IP and
-// refreshes the OpenCode identity for the replay when configured. It returns
-// errClientCanceled if the client canceled, or the rotation error; any other
-// non-nil error means the replay must not happen.
-func (s *Server) prepareReplay(ctx context.Context, resp *http.Response,
+// prepareReplay gets resp ready for a replay: a FreeUsageLimitError rotates
+// the WARP exit IP, while any other retryable answer is retried on the same IP
+// after the Retry-After hint. It returns errClientCanceled if the client went
+// away while waiting.
+func (s *Server) prepareReplay(r *http.Request, resp *http.Response,
 	cfg config.BridgeConfig, ids *identity) error {
-	if wait := retryAfter(resp, time.Now()); wait > 0 {
+	if isUsageLimitError(resp) {
+		return s.rotateForReplay(r, resp, cfg, ids)
+	}
+	wait := retryWait(resp, time.Now())
+	s.note("warn", "upstream %d on %s, retrying on the same IP after %s",
+		resp.StatusCode, r.URL.Path, wait)
+	if wait > 0 {
 		select {
-		case <-ctx.Done():
+		case <-r.Context().Done():
 			resp.Body.Close()
 			return errClientCanceled
 		case <-time.After(wait):
 		}
 	}
 	resp.Body.Close()
-	if err := s.Rotate(ctx); err != nil {
+	return nil
+}
+
+// rotateForReplay rotates the WARP exit IP and, when configured, refreshes the
+// OpenCode identity so the replay leaves from a fresh IP with a fresh session.
+func (s *Server) rotateForReplay(r *http.Request, resp *http.Response,
+	cfg config.BridgeConfig, ids *identity) error {
+	s.note("warn", "free-tier quota on %s, rotating WARP for replay", r.URL.Path)
+	resp.Body.Close()
+	if err := s.Rotate(r.Context()); err != nil {
 		s.note("warn", "rotation before replay failed: %v", err)
 		return err
 	}
@@ -140,6 +163,30 @@ func (s *Server) prepareReplay(ctx context.Context, resp *http.Response,
 		ids.rotate()
 	}
 	return nil
+}
+
+// isUsageLimitError reports whether resp is a 429 whose body marks the
+// free-tier quota, {"error":{"type":"FreeUsageLimitError"}}. Only such a
+// response rotates the WARP IP. The body is buffered and restored.
+func isUsageLimitError(resp *http.Response) bool {
+	if resp.StatusCode != http.StatusTooManyRequests {
+		return false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorPeek))
+	resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	if err != nil {
+		return false
+	}
+	var payload struct {
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return false
+	}
+	return payload.Error.Type == "FreeUsageLimitError"
 }
 
 // roundTrip forwards the buffered request to the upstream once.
@@ -218,20 +265,29 @@ func retryable(cfg config.BridgeConfig, status int) bool {
 	return slices.Contains(cfg.RetryStatuses, status)
 }
 
-// retryAfter parses the Retry-After header (seconds or HTTP date), capped
-// at maxRetryWait.
-func retryAfter(resp *http.Response, now time.Time) time.Duration {
+// retryAfter parses the Retry-After header (seconds or HTTP date), capped at
+// maxRetryWait, and reports whether a value was present and parsable.
+func retryAfter(resp *http.Response, now time.Time) (time.Duration, bool) {
 	v := strings.TrimSpace(resp.Header.Get("Retry-After"))
 	if v == "" {
-		return 0
+		return 0, false
 	}
 	if secs, err := strconv.Atoi(v); err == nil {
-		return clampWait(time.Duration(secs) * time.Second)
+		return clampWait(time.Duration(secs) * time.Second), true
 	}
 	if t, err := http.ParseTime(v); err == nil {
-		return clampWait(t.Sub(now))
+		return clampWait(t.Sub(now)), true
 	}
-	return 0
+	return 0, false
+}
+
+// retryWait is the delay before a non-rotating replay: the Retry-After hint
+// when present and parsable, else defaultRetryWait.
+func retryWait(resp *http.Response, now time.Time) time.Duration {
+	if d, ok := retryAfter(resp, now); ok {
+		return d
+	}
+	return defaultRetryWait
 }
 
 func clampWait(d time.Duration) time.Duration {
