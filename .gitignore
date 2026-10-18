@@ -1,3 +1,4 @@
 bin/
 .env
 config/config.yaml
+state/
