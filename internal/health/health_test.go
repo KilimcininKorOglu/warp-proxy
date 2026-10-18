@@ -116,7 +116,7 @@ func newFixture(t *testing.T, healthBody string) *checkerFixture {
 	}))
 	t.Cleanup(health.Close)
 
-	mgr := warp.NewManager(t.TempDir(), warp.ModeReconnect)
+	mgr := warp.NewManager(t.TempDir(), warp.ModeReconnect, 1)
 	mgr.SetHooks(
 		func(context.Context) (*masque.Identity, error) {
 			return &masque.Identity{ID: "test", IPv4: "172.16.0.2/32"}, nil

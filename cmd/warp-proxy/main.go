@@ -47,7 +47,7 @@ func main() {
 	logSink := &logSink{logs: logs}
 	slog.SetDefault(logger)
 
-	manager := warp.NewManager(cfg.Warp.StateDir, cfg.Warp.ReconnectMode)
+	manager := warp.NewManager(cfg.Warp.StateDir, cfg.Warp.ReconnectMode, cfg.Warp.Accounts)
 	upstream := &proxy.Upstream{DialFunc: manager.Dial, Resolve: manager.ResolveIP}
 
 	// Front rewriting: pool fed by the Clean-IP scan, decisions read the

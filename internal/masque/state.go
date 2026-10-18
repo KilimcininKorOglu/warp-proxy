@@ -31,6 +31,13 @@ const H2FallbackEndpoint = "162.159.198.2"
 // Save writes the identity to <dir>/identity.json atomically: temp file,
 // fsync, rename. The directory is created when missing.
 func (id *Identity) Save(dir string) error {
+	return id.SaveAt(filepath.Join(dir, "identity.json"))
+}
+
+// SaveAt writes the identity to the given file path atomically: temp file
+// in the same directory, fsync, rename over the target.
+func (id *Identity) SaveAt(path string) error {
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create state dir: %w", err)
 	}
@@ -38,7 +45,6 @@ func (id *Identity) Save(dir string) error {
 	if err != nil {
 		return err
 	}
-	path := filepath.Join(dir, "identity.json")
 	tmp, err := os.CreateTemp(dir, "identity-*.tmp")
 	if err != nil {
 		return fmt.Errorf("temp state file: %w", err)
@@ -61,12 +67,18 @@ func (id *Identity) Save(dir string) error {
 // LoadIdentity reads the identity from <dir>/identity.json. Returns
 // os.ErrNotExist when no identity is stored yet.
 func LoadIdentity(dir string) (*Identity, error) {
-	b, err := os.ReadFile(filepath.Join(dir, "identity.json"))
+	return LoadIdentityAt(filepath.Join(dir, "identity.json"))
+}
+
+// LoadIdentityAt reads the identity from the given file path.
+func LoadIdentityAt(path string) (*Identity, error) {
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
+	defer f.Close()
 	var id Identity
-	if err := json.Unmarshal(b, &id); err != nil {
+	if err := json.NewDecoder(f).Decode(&id); err != nil {
 		return nil, fmt.Errorf("parse identity state: %w", err)
 	}
 	return &id, nil

@@ -230,6 +230,10 @@ func applyForm(cfg *config.Config, r *http.Request) {
 	cfg.Panel.Listen = formOr(r, "panel_listen", cfg.Panel.Listen)
 	cfg.HTTPProxy.Listen = formOr(r, "http_listen", cfg.HTTPProxy.Listen)
 	cfg.SOCKS.Listen = formOr(r, "socks_listen", cfg.SOCKS.Listen)
+	cfg.Warp.Accounts = formIntOr(r, "warp_accounts", cfg.Warp.Accounts)
+	if cfg.Warp.Accounts < 1 {
+		cfg.Warp.Accounts = 1
+	}
 	cfg.Warp.ReconnectMode = r.FormValue("reconnect_mode")
 	if cfg.Warp.ReconnectMode != warp.ModeReregister {
 		cfg.Warp.ReconnectMode = warp.ModeReconnect

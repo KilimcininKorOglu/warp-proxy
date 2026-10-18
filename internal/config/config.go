@@ -101,8 +101,11 @@ type ListenerConfig struct {
 
 // WarpConfig describes the built-in MASQUE tunnel.
 type WarpConfig struct {
-	// StateDir holds the device identity. Persisted across restarts.
+	// StateDir holds the device identities. Persisted across restarts.
 	StateDir string `yaml:"state_dir"`
+	// Accounts is the multi-account pool size. 1 means a single tunnel;
+	// more enables round-robin egress rotation across accounts.
+	Accounts int `yaml:"accounts"`
 	// ReconnectMode is "reconnect" (close and reopen the tunnel) or
 	// "reregister" (delete registration, register again, connect).
 	ReconnectMode string `yaml:"reconnect_mode"`
@@ -143,6 +146,7 @@ func Defaults() *Config {
 		SOCKS:     ListenerConfig{Listen: ":8592"},
 		Warp: WarpConfig{
 			StateDir:      "state",
+			Accounts:      1,
 			ReconnectMode: "reconnect",
 		},
 		Health: HealthConfig{

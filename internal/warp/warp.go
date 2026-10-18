@@ -1,6 +1,6 @@
 // Package warp owns the WARP tunnel lifecycle: identity registration, the
-// MASQUE tunnel and the netstack dialer the proxies route through. It
-// replaces the warp-cli driver; the external API is unchanged.
+// MASQUE tunnels and the netstack dialers the proxies route through. It
+// replaces the warp-cli driver and supports a multi-account pool.
 package warp
 
 import (
@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"warp-proxy/internal/masque"
@@ -20,23 +22,6 @@ const (
 	ModeReconnect  = "reconnect"
 	ModeReregister = "reregister"
 )
-
-// Manager keeps one WARP identity and its live tunnel. Dials are served by
-// the current netstack dialer; reconnects swap the tunnel under a lock.
-type Manager struct {
-	stateDir string
-	mode     string // ModeReconnect or ModeReregister
-
-	// hook points for tests; nil means the real implementations.
-	register IdentityFunc
-	connect  ConnectFunc
-
-	mu       sync.RWMutex
-	tun      Tunnel
-	dialer   Dialer
-	endpoint string // pin override applied at the next (re)connect
-	last     time.Time
-}
 
 // Tunnel is the piece of the MASQUE tunnel the manager needs: teardown.
 type Tunnel interface {
@@ -57,9 +42,41 @@ type IdentityFunc = func(ctx context.Context) (*masque.Identity, error)
 type ConnectFunc = func(ctx context.Context, id *masque.Identity,
 	endpoint string) (Tunnel, Dialer, error)
 
-// NewManager builds a Manager persisting identity state under stateDir.
-func NewManager(stateDir string, reconnectMode string) *Manager {
-	m := &Manager{stateDir: stateDir}
+// worker is one account's live tunnel.
+type worker struct {
+	index int
+	id    *masque.Identity
+	tun   Tunnel
+	d     Dialer
+}
+
+// Manager keeps a pool of WARP identities and their live tunnels. With one
+// account it behaves exactly like a single tunnel; with more, dials rotate
+// round-robin across the healthy workers and Reconnect rotates to the next
+// worker instead of bouncing the active one.
+type Manager struct {
+	stateDir string
+	accounts int
+	mode     string // ModeReconnect or ModeReregister
+
+	// hook points for tests; nil means the real implementations.
+	register IdentityFunc
+	connect  ConnectFunc
+
+	mu       sync.RWMutex
+	workers  []*worker
+	rr       atomic.Uint64
+	endpoint string // pin override applied at the next (re)connect
+	last     time.Time
+}
+
+// NewManager builds a Manager persisting identity state under stateDir and
+// maintaining accounts tunnels.
+func NewManager(stateDir string, reconnectMode string, accounts int) *Manager {
+	if accounts < 1 {
+		accounts = 1
+	}
+	m := &Manager{stateDir: stateDir, accounts: accounts}
 	m.SetMode(reconnectMode)
 	return m
 }
@@ -85,10 +102,10 @@ func (m *Manager) LastReconnect() time.Time {
 	return m.last
 }
 
-// Dial routes a connection through the tunnel's netstack. It implements the
-// proxy.Upstream dial contract.
+// Dial routes a connection through a healthy tunnel's netstack,
+// round-robin across the pool. It implements the proxy.Upstream contract.
 func (m *Manager) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
-	d, err := m.currentDialer()
+	d, err := m.pickDialer()
 	if err != nil {
 		return nil, err
 	}
@@ -98,47 +115,65 @@ func (m *Manager) Dial(ctx context.Context, network, addr string) (net.Conn, err
 // ResolveIP resolves a hostname through the tunnel's remote DNS.
 func (m *Manager) ResolveIP(ctx context.Context, host string) (net.IP, error) {
 	m.mu.RLock()
-	d := m.dialer
+	var d Dialer
+	if len(m.workers) > 0 {
+		d = m.workers[0].d
+	}
 	m.mu.RUnlock()
 	if d == nil {
 		return nil, ErrNotConnected
 	}
 	ip, rerr := d.Resolve(ctx, host)
 	if rerr != nil {
-		return nil, fmt.Errorf("resolve %s: %w", host, rerr)
+		return nil, fmt.Errorf("dns: %w", rerr)
 	}
 	return ip, nil
 }
 
-// currentDialer returns the live netstack dialer or ErrNotConnected.
-func (m *Manager) currentDialer() (Dialer, error) {
+// pickDialer returns the dialer of the next healthy worker, scanning the
+// pool once from the round-robin position.
+func (m *Manager) pickDialer() (Dialer, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if m.dialer == nil {
+	n := len(m.workers)
+	if n == 0 {
 		return nil, ErrNotConnected
 	}
-	return m.dialer, nil
+	start := int(m.rr.Add(1)) % n
+	for i := 0; i < n; i++ {
+		w := m.workers[(start+i)%n]
+		if w != nil && w.d != nil {
+			return w.d, nil
+		}
+	}
+	return nil, ErrNotConnected
 }
 
-// EnsureReady makes the tunnel usable: load or register the identity, open
-// the tunnel and start the netstack. An existing registration is kept.
+// EnsureReady brings the pool up: one tunnel per configured account, keeping
+// existing registrations. Failure of some workers is tolerated as long as
+// at least one comes up.
 func (m *Manager) EnsureReady(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.connectLocked(ctx, "")
+	return m.bringUpLocked(ctx, m.endpoint)
 }
 
-// Reconnect obtains a fresh WARP tunnel using the configured mode.
+// Reconnect refreshes the pool. With a single account it re-establishes the
+// tunnel (reregister mode deletes the registration first). With a pool it
+// rotates the round-robin to the next worker for instant egress change and
+// heals the abandoned worker in the background.
 func (m *Manager) Reconnect(ctx context.Context) error {
+	if m.poolSize() > 1 {
+		return m.rotate(ctx)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
 	if m.mode == ModeReregister {
-		if err := m.reregisterLocked(ctx); err != nil {
+		if err := m.reregisterLocked(ctx, 0); err != nil {
 			return err
 		}
 	} else {
-		if err := m.connectLocked(ctx, m.endpoint); err != nil {
+		if err := m.connectLocked(ctx, 0, m.endpoint); err != nil {
 			return err
 		}
 	}
@@ -146,74 +181,173 @@ func (m *Manager) Reconnect(ctx context.Context) error {
 	return nil
 }
 
-// SetEndpoint pins the WARP tunnel to a custom edge endpoint ("host:port")
-// and reconnects so the change takes effect.
+// SetEndpoint pins the tunnels to a custom edge endpoint ("host:port") and
+// reconnects every worker so the change takes effect.
 func (m *Manager) SetEndpoint(ctx context.Context, endpoint string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.endpoint = endpoint
-	if err := m.connectLocked(ctx, endpoint); err != nil {
-		return err
+	for i := range m.workers {
+		if err := m.connectLocked(ctx, i, endpoint); err != nil {
+			return err
+		}
 	}
 	m.last = time.Now()
 	return nil
 }
 
-// Connected reports whether a tunnel is up.
+// rotate advances the round-robin pointer and refreshes the abandoned
+// worker in the background, so the next dial lands on a ready tunnel while
+// the old one regains a fresh IP.
+func (m *Manager) rotate(ctx context.Context) error {
+	m.mu.RLock()
+	n := len(m.workers)
+	m.mu.RUnlock()
+	if n == 0 {
+		return ErrNotConnected
+	}
+	abandoned := int(m.rr.Add(1)) % n
+	m.last = time.Now()
+
+	go func() {
+		hctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if m.mode == ModeReregister {
+			_ = m.reregisterLocked(hctx, abandoned)
+		} else {
+			_ = m.connectLocked(hctx, abandoned, m.endpoint)
+		}
+	}()
+	return nil
+}
+
+// Connected reports whether at least one tunnel is up.
 func (m *Manager) Connected(_ context.Context) (bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.tun != nil, nil
+	for _, w := range m.workers {
+		if w != nil && w.d != nil {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // Status returns a one-line tunnel state for the panel dashboard.
 func (m *Manager) Status(_ context.Context) (string, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if m.tun == nil {
+	up := 0
+	for _, w := range m.workers {
+		if w != nil && w.d != nil {
+			up++
+		}
+	}
+	if up == 0 {
 		return "disconnected", nil
 	}
 	ep := m.endpoint
 	if ep == "" {
 		ep = "default edge"
 	}
-	return fmt.Sprintf("connected (MASQUE, endpoint %s)", ep), nil
+	if len(m.workers) == 1 {
+		return fmt.Sprintf("connected (MASQUE, endpoint %s)", ep), nil
+	}
+	return fmt.Sprintf("connected (MASQUE, %d/%d workers round-robin, endpoint %s)",
+		up, len(m.workers), ep), nil
 }
 
-// connectLocked swaps in a fresh tunnel for the stored identity (registering
-// first when none exists). The old tunnel, if any, is torn down.
-func (m *Manager) connectLocked(ctx context.Context, endpoint string) error {
-	id, err := m.identity(ctx)
-	if err != nil {
-		return err
+// bringUpLocked ensures every configured account has a tunnel, keeping the
+// workers that are already up. It fails only when none could be started.
+func (m *Manager) bringUpLocked(ctx context.Context, endpoint string) error {
+	if len(m.workers) == 0 {
+		m.workers = make([]*worker, m.accounts)
+		for i := range m.workers {
+			m.workers[i] = &worker{index: i}
+		}
 	}
-	tun, dialer, err := m.connectTunnel(ctx, id, endpoint)
-	if err != nil {
-		return err
+	var firstErr error
+	raised := 0
+	for i, w := range m.workers {
+		if w.d != nil {
+			raised++
+			continue
+		}
+		if err := m.connectLocked(ctx, i, endpoint); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		raised++
+		// Space fresh registrations out; the API rate-limits bursts.
+		if i+1 < len(m.workers) {
+			time.Sleep(time.Second)
+		}
 	}
-	m.swap(tun, dialer)
+	if raised == 0 {
+		return firstErr
+	}
 	return nil
 }
 
-// reregisterLocked deletes the old registration and starts over with a fresh
-// identity.
-func (m *Manager) reregisterLocked(ctx context.Context) error {
-	if old, err := masque.LoadIdentity(m.stateDir); err == nil {
+// connectLocked (re)establishes worker i's tunnel for its stored identity.
+func (m *Manager) connectLocked(ctx context.Context, i int, endpoint string) error {
+	m.ensureWorkersLocked()
+	id, err := m.identity(ctx, i)
+	if err != nil {
+		return err
+	}
+	tun, d, err := m.connectTunnel(ctx, id, endpoint)
+	if err != nil {
+		return err
+	}
+	m.swap(i, tun, d)
+	return nil
+}
+
+// ensureWorkersLocked allocates the worker slots when missing, so a
+// Reconnect before EnsureReady cannot index an empty pool.
+func (m *Manager) ensureWorkersLocked() {
+	if len(m.workers) == 0 {
+		m.workers = make([]*worker, m.accounts)
+		for i := range m.workers {
+			m.workers[i] = &worker{index: i}
+		}
+	}
+}
+
+// reregisterLocked deletes worker i's registration and starts over with a
+// fresh identity.
+func (m *Manager) reregisterLocked(ctx context.Context, i int) error {
+	if old, err := masque.LoadIdentityAt(m.identityPath(i)); err == nil {
 		// The fresh registration must not depend on the delete succeeding:
 		// a failed delete only leaves the old device in the account list.
 		delCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		_ = masque.NewClient().Delete(delCtx, old)
 		cancel()
 	}
-	if err := os.Remove(m.stateDir + "/identity.json"); err != nil && !os.IsNotExist(err) {
+	if err := os.Remove(m.identityPath(i)); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove old identity: %w", err)
 	}
-	return m.connectLocked(ctx, m.endpoint)
+	return m.connectLocked(ctx, i, m.endpoint)
 }
 
-// identity loads the stored identity or registers a fresh one, persisting it.
-func (m *Manager) identity(ctx context.Context) (*masque.Identity, error) {
-	if id, err := masque.LoadIdentity(m.stateDir); err == nil {
+// identityPath is worker i's state file. Worker 0 keeps the historical
+// identity.json name so single-account state survives the upgrade.
+func (m *Manager) identityPath(i int) string {
+	if i == 0 {
+		return m.stateDir + "/identity.json"
+	}
+	return m.stateDir + "/acc-" + strconv.Itoa(i) + ".json"
+}
+
+// identity loads worker i's stored identity or registers a fresh one.
+func (m *Manager) identity(ctx context.Context, i int) (*masque.Identity, error) {
+	path := m.identityPath(i)
+	if id, err := masque.LoadIdentityAt(path); err == nil {
 		return id, nil
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("load identity: %w", err)
@@ -222,7 +356,7 @@ func (m *Manager) identity(ctx context.Context) (*masque.Identity, error) {
 	if err != nil {
 		return nil, fmt.Errorf("register: %w", err)
 	}
-	if err := id.Save(m.stateDir); err != nil {
+	if err := id.SaveAt(path); err != nil {
 		return nil, fmt.Errorf("save identity: %w", err)
 	}
 	return id, nil
@@ -236,13 +370,14 @@ func (m *Manager) registerIdentity(ctx context.Context) (*masque.Identity, error
 	return masque.RegisterAuto(ctx, masque.Options{Name: "warp-proxy"})
 }
 
-// swap installs the new tunnel and dialer, dropping the old ones.
-func (m *Manager) swap(tun Tunnel, d Dialer) {
-	if m.tun != nil {
-		m.tun.Close()
+// swap installs worker i's new tunnel and dialer, dropping the old ones.
+func (m *Manager) swap(i int, tun Tunnel, d Dialer) {
+	w := m.workers[i]
+	if w.tun != nil {
+		w.tun.Close()
 	}
-	m.tun = tun
-	m.dialer = d
+	w.tun = tun
+	w.d = d
 }
 
 // connectTunnel is the real connect path, split out for test injection.
@@ -268,6 +403,14 @@ func (m *Manager) connectTunnel(ctx context.Context, id *masque.Identity,
 func (m *Manager) SetHooks(register IdentityFunc, connect ConnectFunc) {
 	m.register = register
 	m.connect = connect
+}
+
+// poolSize reports the configured account count.
+func (m *Manager) poolSize() int {
+	if m.accounts < 1 {
+		return 1
+	}
+	return m.accounts
 }
 
 // ErrNotConnected is returned when the tunnel should be up but is not.

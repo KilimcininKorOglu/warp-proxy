@@ -11,7 +11,8 @@ socks_proxy:
 
 # Built-in MASQUE tunnel (no warp-cli).
 warp:
-  state_dir: "state"            # device identity, persisted across restarts
+  state_dir: "state"            # device identities, persisted across restarts
+  accounts: 1                   # >1 enables the multi-account round-robin pool
   reconnect_mode: "reconnect"   # or "reregister"
 
 # Periodic check through the WARP tunnel. Generic by default; add bot
