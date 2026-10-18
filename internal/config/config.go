@@ -83,7 +83,9 @@ func Defaults() *Config {
 		HTTPProxy: ListenerConfig{Listen: ":8591"},
 		SOCKS:     ListenerConfig{Listen: ":8592"},
 		Warp: WarpConfig{
-			Binary:        "warp-cli",
+			Binary: "warp-cli",
+			// Non-interactive environments must accept the ToS flag.
+			CLIArgs:       []string{"--accept-tos"},
 			ProxyAddr:     "127.0.0.1:40000",
 			ReconnectMode: "reconnect",
 		},

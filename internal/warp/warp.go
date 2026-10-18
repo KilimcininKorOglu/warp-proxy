@@ -167,7 +167,8 @@ func isAlreadyRegistered(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "already registered") ||
-		strings.Contains(msg, "already exists")
+		strings.Contains(msg, "already exists") ||
+		strings.Contains(msg, "old registration")
 }
 
 // ErrNotConnected is returned when the tunnel should be up but is not.

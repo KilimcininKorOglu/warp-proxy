@@ -12,7 +12,7 @@ socks_proxy:
 # warp-cli driver.
 warp:
   binary: "warp-cli"
-  cli_args: []          # example for old clients: ["--accept-tos"]
+  cli_args: ["--accept-tos"]   # required in non-interactive environments
   proxy_addr: "127.0.0.1:40000"
   reconnect_mode: "reconnect"   # or "reregister"
 
