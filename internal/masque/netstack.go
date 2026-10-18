@@ -23,8 +23,10 @@ import (
 // nicID is the single netstack interface backed by the tunnel.
 const nicID tcpip.NICID = 1
 
-// linkMTU is the netstack interface MTU, matching the tunnel budget.
-const linkMTU = 1280
+// linkMTU is the netstack interface MTU. It must not exceed the tunnel's
+// datagram budget (MaxIPPacket): a larger segment would fail SendIP and
+// silently kill the outbound pump, blackholing the whole stack.
+const linkMTU = MaxIPPacket
 
 // packetQueue is the depth of the outbound (netstack -> tunnel) queue.
 const packetQueue = 256
@@ -114,6 +116,9 @@ func (d *NetstackDialer) pumpOut() {
 		err := d.tun.SendIP(b)
 		pkt.DecRef()
 		if err != nil {
+			// Without an outbound path the netstack is dead; stop and let
+			// the reconnect replace tunnel and dialer together.
+			h2Debug("pumpOut stopped: %v", err)
 			return
 		}
 	}

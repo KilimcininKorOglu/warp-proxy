@@ -43,9 +43,11 @@ type Tunnel interface {
 	Close() error
 }
 
-// Dialer is the piece of the netstack the proxies need: the dial contract.
+// Dialer is the piece of the netstack the proxies need: the dial contract
+// plus remote resolution.
 type Dialer interface {
 	Dial(ctx context.Context, network, addr string) (net.Conn, error)
+	Resolve(ctx context.Context, host string) (net.IP, error)
 }
 
 // IdentityFunc registers a fresh device identity (test hook).
@@ -86,13 +88,36 @@ func (m *Manager) LastReconnect() time.Time {
 // Dial routes a connection through the tunnel's netstack. It implements the
 // proxy.Upstream dial contract.
 func (m *Manager) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	d, err := m.currentDialer()
+	if err != nil {
+		return nil, err
+	}
+	return d.Dial(ctx, network, addr)
+}
+
+// ResolveIP resolves a hostname through the tunnel's remote DNS.
+func (m *Manager) ResolveIP(ctx context.Context, host string) (net.IP, error) {
 	m.mu.RLock()
 	d := m.dialer
 	m.mu.RUnlock()
 	if d == nil {
 		return nil, ErrNotConnected
 	}
-	return d.Dial(ctx, network, addr)
+	ip, rerr := d.Resolve(ctx, host)
+	if rerr != nil {
+		return nil, fmt.Errorf("resolve %s: %w", host, rerr)
+	}
+	return ip, nil
+}
+
+// currentDialer returns the live netstack dialer or ErrNotConnected.
+func (m *Manager) currentDialer() (Dialer, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.dialer == nil {
+		return nil, ErrNotConnected
+	}
+	return m.dialer, nil
 }
 
 // EnsureReady makes the tunnel usable: load or register the identity, open

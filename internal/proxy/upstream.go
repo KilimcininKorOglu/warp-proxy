@@ -22,6 +22,9 @@ type Upstream struct {
 	// IP before the dial. It receives the context and the original address
 	// and returns the address to dial plus whether it changed anything.
 	Front func(ctx context.Context, hostPort string) (string, bool)
+	// Resolve, when set, resolves hostnames through the tunnel for the
+	// SOCKS5 server, so client hostnames never touch the host resolver.
+	Resolve func(ctx context.Context, host string) (net.IP, error)
 }
 
 // handshakeTimeout returns the configured or default dial timeout.

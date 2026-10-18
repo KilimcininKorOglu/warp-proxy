@@ -84,6 +84,10 @@ func (noopDialer) Dial(context.Context, string, string) (net.Conn, error) {
 	return nil, errors.New("no tunnel in this test")
 }
 
+func (noopDialer) Resolve(context.Context, string) (net.IP, error) {
+	return nil, errors.New("no tunnel in this test")
+}
+
 // plainDial dials directly from the host, standing in for the tunnel.
 func plainDial(ctx context.Context, network, addr string) (net.Conn, error) {
 	var d net.Dialer

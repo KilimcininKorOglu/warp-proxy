@@ -21,6 +21,18 @@ func (w slogWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// tunnelResolver adapts the upstream's tunnel resolver to the SOCKS5
+// library's NameResolver interface.
+type tunnelResolver struct {
+	resolve func(ctx context.Context, host string) (net.IP, error)
+}
+
+// Resolve implements socks5.NameResolver.
+func (r tunnelResolver) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
+	ip, err := r.resolve(ctx, name)
+	return ctx, ip, err
+}
+
 // SOCKSServer is the client facing SOCKS5 proxy. Every client connection is
 // dialed through the Upstream, so SOCKS5 traffic also exits via WARP.
 type SOCKSServer struct {
@@ -35,6 +47,9 @@ func (s *SOCKSServer) Serve(ln net.Listener) error {
 		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return s.Upstream.Dial(ctx, network, addr)
 		},
+	}
+	if s.Upstream.Resolve != nil {
+		conf.Resolver = tunnelResolver{s.Upstream.Resolve}
 	}
 	if s.Log != nil {
 		conf.Logger = log.New(slogWriter{s.Log}, "", 0)

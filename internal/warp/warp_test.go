@@ -156,3 +156,7 @@ type fakeDialer struct{}
 func (fakeDialer) Dial(context.Context, string, string) (net.Conn, error) {
 	return nil, errors.New("fake dialer")
 }
+
+func (fakeDialer) Resolve(context.Context, string) (net.IP, error) {
+	return nil, errors.New("fake dialer")
+}

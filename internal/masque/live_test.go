@@ -147,3 +147,79 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+// TestLiveIdleSurvival keeps the tunnel idle past the negotiated idle
+// timeout and then dials again: keep-alive must keep it usable.
+func TestLiveIdleSurvival(t *testing.T) {
+	liveGuard(t)
+	id := loadLiveIdentity(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+	defer cancel()
+	tun, err := Dial(ctx, id, "")
+	if err != nil {
+		t.Fatalf("tunnel: %v", err)
+	}
+	defer tun.Close()
+	d, err := NewNetstackDialer(tun, id)
+	if err != nil {
+		t.Fatalf("netstack: %v", err)
+	}
+	conn, err := d.Dial(ctx, "tcp", "cloudflare.com:80")
+	if err != nil {
+		t.Fatalf("dial before idle: %v", err)
+	}
+	conn.Close()
+	t.Log("idle 60s starting")
+	time.Sleep(60 * time.Second)
+	conn2, err := d.Dial(ctx, "tcp", "cloudflare.com:80")
+	if err != nil {
+		t.Fatalf("dial after idle: %v", err)
+	}
+	conn2.Close()
+	t.Log("tunnel survived idle and dialed again")
+}
+
+// TestLiveAppFlow mimics the app: open a tunnel, wait ~15s, then carry an
+// HTTPS request through the netstack. Repeat to see whether later tunnels
+// degrade the way the daemon's did.
+func TestLiveAppFlow(t *testing.T) {
+	liveGuard(t)
+	id := loadLiveIdentity(t)
+	for round := 1; round <= 3; round++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		tun, err := Dial(ctx, id, "")
+		if err != nil {
+			cancel()
+			t.Fatalf("round %d: tunnel: %v", round, err)
+		}
+		d, err := NewNetstackDialer(tun, id)
+		if err != nil {
+			tun.Close()
+			cancel()
+			t.Fatalf("round %d: netstack: %v", round, err)
+		}
+		time.Sleep(15 * time.Second)
+		conn, err := d.Dial(ctx, "tcp", "www.cloudflare.com:443")
+		if err != nil {
+			tun.Close()
+			cancel()
+			t.Fatalf("round %d: dial: %v", round, err)
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		buf := make([]byte, 64)
+		_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if _, err := conn.Write([]byte("GET /cdn-cgi/trace HTTP/1.1\r\nHost: www.cloudflare.com\r\nConnection: close\r\n\r\n")); err != nil {
+			tun.Close()
+			cancel()
+			t.Fatalf("round %d: write: %v", round, err)
+		}
+		n, err := conn.Read(buf)
+		tun.Close()
+		cancel()
+		if err != nil && n == 0 {
+			t.Fatalf("round %d: read: %v", round, err)
+		}
+		t.Logf("round %d: %q", round, buf[:min(n, 40)])
+		time.Sleep(2 * time.Second)
+	}
+}
