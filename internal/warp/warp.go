@@ -159,6 +159,43 @@ func (m *Manager) reregister(ctx context.Context) error {
 	return nil
 }
 
+// SetEndpoint pins the WARP tunnel to a custom edge endpoint ("ip:port")
+// and reconnects so the change takes effect. Command names differ across
+// warp-cli versions, so the known variants are tried in order and the
+// first success wins.
+func (m *Manager) SetEndpoint(ctx context.Context, endpoint string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var setErr error
+	for _, args := range [][]string{
+		{"tunnel", "endpoint", "set", endpoint},
+		{"set-custom-endpoint", endpoint},
+	} {
+		if _, err := m.run(ctx, args...); err == nil {
+			setErr = nil
+			break
+		} else {
+			setErr = fmt.Errorf("warp-cli %s: %w", strings.Join(args, " "), err)
+		}
+	}
+	if setErr != nil {
+		return setErr
+	}
+	// Reconnect through the new endpoint.
+	var err error
+	if m.reconnect == ModeReregister {
+		err = m.reregister(ctx)
+	} else {
+		err = m.simpleReconnect(ctx)
+	}
+	if err != nil {
+		return err
+	}
+	m.last = time.Now()
+	return nil
+}
+
 // isAlreadyRegistered reports whether err is warp-cli telling us the client
 // already has a registration.
 func isAlreadyRegistered(err error) bool {

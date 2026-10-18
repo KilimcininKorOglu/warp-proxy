@@ -3,6 +3,7 @@
 package web
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"warp-proxy/internal/cleanip"
 	"warp-proxy/internal/config"
 	"warp-proxy/internal/health"
 	"warp-proxy/internal/logbuf"
@@ -38,9 +40,18 @@ type Server struct {
 	// restart (upstream address, limiter).
 	OnLiveConfigChange func(cfg *config.Config)
 
+	// Scanner runs a clean-IP latency scan and returns ranked results.
+	Scanner func(ctx context.Context, cfg *config.Config) ([]cleanip.Result, error)
+	// EndpointApplier pins a chosen "ip:port" edge endpoint and
+	// reconnects WARP; it returns the rate-limit or command error.
+	EndpointApplier func(ctx context.Context, endpoint string) error
+
 	tpl      *template.Template
 	mu       sync.Mutex
 	sessions map[string]time.Time
+	scan     []cleanip.Result
+	scanErr  string
+	scanAt   time.Time
 }
 
 // New builds the Server and parses the embedded templates.
@@ -63,6 +74,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /settings", s.requireAuth(s.doSettings))
 	mux.HandleFunc("GET /logs", s.requireAuth(s.showLogs))
 	mux.HandleFunc("POST /logs/clear", s.requireAuth(s.clearLogs))
+	mux.HandleFunc("GET /cleanip", s.requireAuth(s.showCleanIP))
+	mux.HandleFunc("POST /cleanip/scan", s.requireAuth(s.doCleanIPScan))
+	mux.HandleFunc("POST /cleanip/apply", s.requireAuth(s.doCleanIPApply))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "ok")

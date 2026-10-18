@@ -1,0 +1,42 @@
+{{template "head" .}}
+
+<div class="card">
+  <h2>Clean-IP scanner</h2>
+  <p class="muted">Sunucudan Cloudflare edge IP'lerine TCP bağlantı süresi ölçer; ölçüm WARP dışından yapılır. Uygula dediğinizde seçilen IP, WARP tünelinin özel endpoint'i olur ve tünel yeniden bağlanır (rate-limit'e tabidir).</p>
+  <form method="post" action="/cleanip/scan">
+    <table>
+      <tr><th>Port</th><td><input type="text" name="port" value="{{.Cfg.CleanIP.Port}}"></td></tr>
+      <tr><th>Aralık başına örnek</th><td><input type="text" name="samples_per_range" value="{{.Cfg.CleanIP.SamplesPerRange}}"></td></tr>
+      <tr><th>Eşzamanlı ölçüm</th><td><input type="text" name="workers" value="{{.Cfg.CleanIP.Workers}}"></td></tr>
+      <tr><th>Timeout</th><td><input type="text" name="timeout" value="{{.Cfg.CleanIP.Timeout}}"></td></tr>
+      <tr><th>İlk N sonuç</th><td><input type="text" name="top" value="{{.Cfg.CleanIP.Top}}"></td></tr>
+    </table>
+    <p><button type="submit">Tara</button></p>
+  </form>
+</div>
+
+{{if .ScanErr}}<div class="error">Tarama hatası: {{.ScanErr}}</div>{{end}}
+
+{{if .Results}}
+<div class="card">
+  <h2>Sonuçlar {{if not .ScanAt.IsZero}}<span class="muted">({{.ScanAt.Format "02.01.2006 15:04:05"}})</span>{{end}}</h2>
+  <table>
+    <tr><th style="width:60px">#</th><th>IP</th><th style="width:140px">Latency</th><th></th></tr>
+    {{range $i, $r := .Results}}
+    <tr>
+      <td>{{$i}}</td>
+      <td class="log">{{$r.IP}}</td>
+      <td>{{$r.Latency.Milliseconds}} ms</td>
+      <td>
+        <form class="inline" method="post" action="/cleanip/apply">
+          <input type="hidden" name="ip" value="{{$r.IP}}">
+          <input type="hidden" name="port" value="{{$.Cfg.CleanIP.Port}}">
+          <button type="submit">Uygula</button>
+        </form>
+      </td>
+    </tr>
+    {{end}}
+  </table>
+</div>
+{{end}}
+{{template "foot" .}}

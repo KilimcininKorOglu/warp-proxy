@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -76,6 +77,15 @@ func main() {
 		upstream.Addr = c.Warp.ProxyAddr
 		manager.SetMode(c.Warp.ReconnectMode)
 		applyLimiter(c, checker)
+	}
+	panel.Scanner = web.RunScan
+	panel.EndpointApplier = func(ctx context.Context, endpoint string) error {
+		if dec := checker.AllowReconnect(); !dec.Allowed {
+			return fmt.Errorf("rate limited: %s", dec)
+		}
+		err := manager.SetEndpoint(ctx, endpoint)
+		checker.RecordReconnect(err == nil)
+		return err
 	}
 
 	// Listeners: each failure is fatal and logged.

@@ -21,7 +21,17 @@ type Config struct {
 	Warp      WarpConfig      `yaml:"warp"`
 	Health    HealthConfig    `yaml:"health"`
 	Reconnect ReconnectConfig `yaml:"reconnect"`
+	CleanIP   CleanIPConfig   `yaml:"cleanip"`
 	Auth      AuthConfig      `yaml:"auth"`
+}
+
+// CleanIPConfig configures the Cloudflare edge latency scanner.
+type CleanIPConfig struct {
+	Port            int    `yaml:"port"`
+	SamplesPerRange int    `yaml:"samples_per_range"`
+	Workers         int    `yaml:"workers"`
+	Timeout         string `yaml:"timeout"`
+	Top             int    `yaml:"top"`
 }
 
 // PanelConfig configures the web panel listener.
@@ -103,6 +113,13 @@ func Defaults() *Config {
 			MinInterval:        "60s",
 			MaxConsecutive:     5,
 			CooldownAfterBurst: "10m",
+		},
+		CleanIP: CleanIPConfig{
+			Port:            443,
+			SamplesPerRange: 4,
+			Workers:         50,
+			Timeout:         "2s",
+			Top:             20,
 		},
 		Auth: AuthConfig{Username: "admin"},
 	}

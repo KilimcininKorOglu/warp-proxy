@@ -73,6 +73,16 @@ func (c *Checker) limiter() *Limiter {
 	return c.lim
 }
 
+// AllowReconnect asks the rate limiter whether a reconnect may run now.
+func (c *Checker) AllowReconnect() Decision {
+	return c.limiter().Allow(time.Now())
+}
+
+// RecordReconnect counts one reconnect attempt and its result.
+func (c *Checker) RecordReconnect(succeeded bool) {
+	c.limiter().Record(time.Now(), succeeded)
+}
+
 // UpdateLimiter replaces the limiter settings while keeping counters when
 // the identity stays the same.
 func (c *Checker) UpdateLimiter(min time.Duration, maxConsecutive int, cooldown time.Duration) {

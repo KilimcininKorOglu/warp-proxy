@@ -33,6 +33,10 @@ browser --> :8590 panel       --/
 - `internal/web` serves the panel: status, exit IP, counters, manual
   reconnect, editable settings and a log view. Login is a username plus a
   bcrypt password hash with a cookie session.
+- `internal/cleanip` is the Clean-IP scanner: it measures TCP latency from
+  the server to candidate Cloudflare edge IPs (official ips-v4 list), ranks
+  the fastest, and can pin one as the WARP tunnel endpoint
+  (`warp-cli tunnel endpoint set` plus a rate-limited reconnect).
 
 ## Run
 

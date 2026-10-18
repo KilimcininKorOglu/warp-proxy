@@ -34,6 +34,15 @@ reconnect:
   max_consecutive: 5
   cooldown_after_burst: "10m"
 
+# Clean-IP scanner: TCP latency from this host to candidate Cloudflare
+# edge IPs; the winner can be pinned as the WARP tunnel endpoint.
+cleanip:
+  port: 443
+  samples_per_range: 4
+  workers: 50
+  timeout: "2s"
+  top: 20
+
 # Panel login. The password is written on first start from the
 # WARP_PROXY_PASSWORD environment variable; only the bcrypt hash is stored.
 auth:
