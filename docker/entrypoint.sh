@@ -9,4 +9,7 @@ if [ ! -f /etc/warp-proxy/config.yaml ] && [ -f /etc/warp-proxy/config.example.y
     cp /etc/warp-proxy/config.example.yaml /etc/warp-proxy/config.yaml
 fi
 
+# state_dir defaults to "state"; run from the config dir so the identity
+# lands on the persisted volume mount (/etc/warp-proxy/state).
+cd /etc/warp-proxy
 exec /usr/local/bin/warp-proxy --config /etc/warp-proxy/config.yaml
