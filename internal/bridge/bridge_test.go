@@ -323,3 +323,60 @@ func TestOversizedBodyRejected(t *testing.T) {
 		t.Errorf("status = %d, want 413", resp.StatusCode)
 	}
 }
+
+// TestPublicProxyFallbackAfterExhaustedRetries proves the public pool is
+// the last resort: the upstream keeps answering the free-tier 429, the WARP
+// retries run out, and the final attempt exits through the public proxy.
+func TestPublicProxyFallbackAfterExhaustedRetries(t *testing.T) {
+	var upstreamCalls, publicCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"type":"FreeUsageLimitError"}}`)
+	}))
+	t.Cleanup(upstream.Close)
+	public := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		publicCalls.Add(1)
+		_, _ = io.WriteString(w, `{"via":"public"}`)
+	}))
+	t.Cleanup(public.Close)
+	tURL, _ := url.Parse(upstream.URL)
+
+	srv := New(dialUpstream(tURL.Host), logbuf.New(32), discardLogger(),
+		func(context.Context) error { return nil },
+		func() config.BridgeConfig {
+			return config.BridgeConfig{
+				Enabled:       true,
+				Upstream:      upstream.URL,
+				RetryStatuses: []int{429},
+				RetryAttempts: 1,
+				MaxConcurrent: 3,
+				MinInterval:   "0s",
+				Timeout:       "10s",
+			}
+		})
+	pu, _ := url.Parse(public.URL)
+	srv.Public = func(context.Context) *http.Transport {
+		return &http.Transport{Proxy: http.ProxyURL(pu)}
+	}
+	bridgeSrv := httptest.NewServer(srv)
+	t.Cleanup(bridgeSrv.Close)
+
+	resp, err := http.Post(bridgeSrv.URL+"/v1/chat/completions", "application/json",
+		bytes.NewBufferString(`{"prompt":"hi"}`))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != 200 || string(body) != `{"via":"public"}` {
+		t.Errorf("status=%d body=%q, want 200 via public", resp.StatusCode, body)
+	}
+	if upstreamCalls.Load() != 2 {
+		t.Errorf("upstream calls = %d, want 2 (initial + one replay)", upstreamCalls.Load())
+	}
+	if publicCalls.Load() != 1 {
+		t.Errorf("public calls = %d, want 1 (fallback only after retries)", publicCalls.Load())
+	}
+}
