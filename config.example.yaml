@@ -12,8 +12,12 @@ socks_proxy:
 # Built-in MASQUE tunnel (no warp-cli).
 warp:
   state_dir: "state"            # device identities, persisted across restarts
-  accounts: 1                   # >1 enables the multi-account round-robin pool
-  reconnect_mode: "reconnect"   # or "reregister"
+  accounts: 1                   # >1 enables the multi-account pool; needs a restart
+  reconnect_mode: "reconnect"   # or "reregister" (delete + fresh registration)
+  distribution: "off"           # "round-robin" keeps every account's tunnel
+                                # open and spreads requests per request; restart
+  ipv6_preference: "off"        # "prefer" exits AAAA targets via WARP IPv6;
+                                # "only" resolves AAAA only; applies live
 
 # Periodic check through the WARP tunnel. Generic by default; add bot
 # markers only if your use case needs marker detection (for example the
@@ -71,6 +75,22 @@ bridge:
   # client sent them) so the replay carries a fresh identity. Costs the
   # replayed request its prompt-cache affinity.
   rotate_session_on_retry: true
+
+# Public proxy fallback pool: scraped lists, verified with a real request;
+# the bridge uses it only after the WARP retries are exhausted.
+public_proxy:
+  enabled: true
+  interval: "30m"               # rescan cadence
+  max: 100                      # verified proxies kept, fastest first
+  workers: 100                  # concurrent check goroutines
+  timeout: "10s"
+  check_url: "http://www.cloudflare.com/cdn-cgi/trace"
+  sources:
+    - "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt"
+    - "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt"
+    - "https://sunny9577.github.io/proxy-scraper/generated/socks5_proxies.txt"
+    - "https://sunny9577.github.io/proxy-scraper/generated/http_proxies.txt"
+    - "https://raw.githubusercontent.com/berkay-digital/Proxy-Scraper/main/proxies.txt"
 
 # Panel login. The password is written on first start from the
 # WARP_PROXY_PASSWORD environment variable; only the bcrypt hash is stored.

@@ -1,124 +1,76 @@
 # warp-proxy
 
-warp-proxy routes all client traffic through Cloudflare WARP. It manages the
-official `warp-cli` client in proxy mode and exposes HTTP and SOCKS5 proxy
-listeners, an OpenAI-compatible AI bridge and a Turkish admin web panel.
+warp-proxy routes all client traffic through Cloudflare WARP and serves the
+OpenCode free tier through an OpenAI- and Anthropic-compatible AI bridge. It
+implements WARP's MASQUE protocol in-process — there is no `warp-cli`, no
+`warp-svc`, no tun device, and the container runs unprivileged. One Go binary
+exposes an HTTP proxy, a SOCKS5 proxy, the AI bridge and a Turkish admin web
+panel.
 
-YouTube and many other services block most VPS and cloud IP addresses. A
-WARP tunnel gives the machine a Cloudflare exit address instead. When the
-health check detects a problem (a configured marker in the response body, a
-transport error, or `warp=off` in the trace), warp-proxy reconnects WARP for
-a fresh address, rate-limited so it cannot loop.
-
-The proxy is general purpose: HTTP and SOCKS5 clients reach any target, and
-the health-check targets and bot markers are fully configurable in the panel
-or `config.yaml`.
+YouTube and many other services block most VPS and cloud IP addresses. A WARP
+tunnel gives the machine a Cloudflare exit address instead. When the health
+check detects a problem (a configured marker in the response body, a transport
+error, or `warp=off` in the trace), warp-proxy reconnects for a fresh address,
+rate-limited so it cannot loop.
 
 ## How it works
 
 ```
 client --> :8591 HTTP proxy  --\
-client --> :8592 SOCKS5        +--> warp-cli proxy 127.0.0.1:40000 --> WARP
+client --> :8592 SOCKS5        +--> MASQUE tunnel (in-process) --> WARP
 AI tool --> :8593 bridge      --/
 browser --> :8590 panel
 ```
 
-- `internal/warp` drives `warp-cli` (registration, `mode proxy`,
-  connect/disconnect). Two reconnect modes: `reconnect`
-  (disconnect + connect) and `reregister` (delete + new registration).
-- `internal/health` checks the tunnel periodically, detects flags and
-  triggers rate-limited reconnects. Limits: minimum interval between
-  reconnects, a burst cap, and a cooldown after the burst.
+- `internal/masque` is the WARP MASQUE client: device registration (P-256 key,
+  DoH bypass for poisoned DNS), the CONNECT-IP tunnel over HTTP/3 datagrams
+  with a hand-written HTTP/2 fallback, and a gVisor userspace netstack that
+  turns tunnel IP packets into TCP dials with remote DNS.
+- `internal/warp` owns the tunnel lifecycle and the multi-account pool. Every
+  account keeps its identity on disk (`state/`); rotation opens the next
+  account's fresh session and closes the old tunnel only after the new one is
+  up, so a failed rotation never takes the working tunnel down.
+- `internal/health` checks the tunnel periodically and triggers rate-limited
+  reconnects (minimum interval, burst cap, cooldown after the burst).
 - `internal/proxy` implements the HTTP CONNECT proxy and the SOCKS5 server;
-  both dial every target through the warp-cli upstream proxy.
-- `internal/web` serves the panel: status, exit IP, counters, manual
-  reconnect, editable settings and a log view. Login is a username plus a
-  bcrypt password hash with a cookie session.
-- `internal/cleanip` is the Clean-IP scanner: it measures TCP latency from
-  the server to candidate Cloudflare edge IPs (official ips-v4 list), ranks
-  the fastest, and can pin one as the WARP tunnel endpoint
-  (`warp-cli tunnel endpoint set` plus a rate-limited reconnect).
-- `internal/front` rewrites Cloudflare-fronted targets to those fastest
-  edge IPs ("front IPs"). A host qualifies through the panel's domain
-  suffix list or automatic detection that it resolves inside Cloudflare's
-  ranges; decisions are cached per host. TLS SNI is untouched, so only
-  Cloudflare-fronted sites are rewritten and the pool stays empty until a
-  Clean-IP scan has run.
-- `internal/bridge` is the AI bridge: an OpenAI-compatible reverse proxy on
-  :8593 that forwards requests to the configured upstream through WARP.
-  A retryable status (429 by default) is replayed: a 429 whose body is a
-  `FreeUsageLimitError` rotates the WARP exit IP first, while any other
-  retryable answer is retried on the same IP after `Retry-After` (5 s when
-  absent). Requests are forwarded unchanged, except for the OpenCode
-  free-tier identity (`bridge.inject_session`, on by default): the bridge
-  adds the `X-Opencode-Session` and `X-Opencode-Request` headers, an
-  opencode `User-Agent` and stub tool entries when the client did not
-  provide them. Client values are kept on the first attempt; after a WARP
-  rotation the ids are refreshed (`bridge.rotate_session_on_retry`).
+  both dial every target through the tunnel, resolving hostnames remotely so
+  client hostnames never leak.
+- `internal/bridge` is the AI bridge (see below).
+- `internal/publicproxy` scrapes public proxy lists, verifies every candidate
+  with a real request and keeps the survivors as a fallback exit pool.
+- `internal/cleanip` scans the registration's home edge and pins the fastest
+  endpoint; `internal/front` rewrites Cloudflare-fronted targets to the
+  fastest scanned edge IPs.
+- `internal/web` serves the panel: status, per-account exit IPs, manual
+  reconnect, Clean-IP and public-proxy pages, editable settings and a log view.
 
-## Using the AI bridge with opencode
+## Run with Docker
 
-Point the free `opencode` provider at the bridge by merging one key into
-`~/.config/opencode/opencode.json`:
-
-```json
-{
-  "provider": {
-    "opencode": {
-      "options": {
-        "baseURL": "http://HOST:8593/v1"
-      }
-    }
-  }
-}
-```
-
-`HOST` is the machine running warp-proxy. The bridge forwards everything to
-`bridge.upstream` (`https://opencode.ai/zen` by default) through WARP; when
-the free tier answers a 429 with a `FreeUsageLimitError`, the bridge rotates
-WARP and replays automatically (rate-limited, `bridge.retry_attempts`). Any
-other retryable status is retried on the same IP after `Retry-After`. Any
-OpenAI-compatible client works the same way: set its base URL to
-`http://HOST:8593/v1`. The upstream, retry statuses and limits are editable
-in the panel's settings page.
-
-## Free-tier session headers
-
-OpenCode's free tier keys anonymous traffic on the `X-Opencode-Session`
-header; a bare request that lacks it lands in the anonymous quota and can be
-rejected with `FreeUsageLimitError`. When `bridge.inject_session` is on (the
-default), the bridge adds, on every upstream request that does not already
-carry them:
-
-- `X-Opencode-Session` — `ses_` followed by 26 digits
-- `X-Opencode-Request` — `msg_` followed by 24 alphanumeric characters
-- an opencode `User-Agent` (an empty or non-opencode one is replaced)
-- stub entries in the `tools` array of chat bodies (the free gateway
-  requires at least two)
-
-Values sent by the client are respected and never overwritten on the first
-attempt. When a `FreeUsageLimitError` rotates the WARP IP, the bridge can
-also refresh the session and request ids so the replay carries a fresh
-identity (`rotate_session_on_retry`, on by default): this overrides even a
-client-provided session, trading the replayed request's prompt-cache affinity
-for a new session bucket. Toggle the whole feature off with
-`inject_session: false` in the config or the panel.
-
-## Run
-
-Set a first-run password and start:
+Requirements: Docker with Compose v2. No privileged mode, no kernel modules,
+no extra packages.
 
 ```sh
+git clone <this repo> warp-proxy
+cd warp-proxy
 echo 'WARP_PROXY_PASSWORD=change-me' > .env
 docker compose up -d --build
 ```
 
-The container runs `warp-svc`, registers WARP on first start (the
-registration persists in the `warp-registration` volume), switches to proxy
-mode, connects, then starts the Go binary.
+What happens on first start:
 
-Open `http://<host>:8590`, log in with `admin` and the password. Use the
-proxy ports from any client:
+1. The image builds (Go is compiled inside a stage; the runtime image is
+   `debian:bookworm-slim`).
+2. The app registers three things lazily: with `warp.accounts: 1` it
+   registers one WARP device on the Cloudflare API and opens the MASQUE
+   tunnel. Identities persist in the `warp-state` volume, so restarts reuse
+   them.
+3. The public proxy pool runs its first scrape (optional, see below).
+
+Then open the panel and log in:
+
+- Panel: `http://<host>:8590` — user `admin`, password from `.env`.
+
+Use the proxies from any client:
 
 ```sh
 curl -x http://HOST:8591 https://www.cloudflare.com/cdn-cgi/trace
@@ -127,24 +79,123 @@ curl --socks5 HOST:8592 https://www.cloudflare.com/cdn-cgi/trace
 
 `warp=on` in the trace confirms the exit goes through WARP.
 
+Updating is the same command:
+
+```sh
+git pull && docker compose up -d --build
+```
+
+Volumes: `warp-state` holds the device identities; `./config` holds
+`config.yaml` (mounted as a directory because the app writes the config
+atomically via rename). The first-run panel password comes from
+`WARP_PROXY_PASSWORD` in `.env`; only the bcrypt hash is stored afterwards.
+
+## Using the AI bridge (no opencode client needed)
+
+The bridge on `:8593` is a standalone free-tier gateway: any OpenAI- or
+Anthropic-compatible client works without installing `opencode`. The bridge
+reproduces the free tier's client fingerprint itself (User-Agent, canonical
+session id, a tool named `read`, forced streaming) and exits through WARP.
+
+```sh
+# OpenAI format (JSON in, JSON out; streaming also supported)
+curl http://HOST:8593/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"minimax-m3.1-flash-free","messages":[{"role":"user","content":"hi"}]}'
+
+# Anthropic format
+curl http://HOST:8593/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{"model":"minimax-m3.1-flash-free","max_tokens":256,"messages":[{"role":"user","content":"hi"}]}'
+
+# Model catalogue: free models only, one list for both API flavors
+curl http://HOST:8593/v1/models
+```
+
+Free-model ids end in `-free`; the catalogue passes the upstream entries
+through verbatim and adds the fields Anthropic clients expect
+(`type`, `display_name`). Requests without `stream: true` are answered with
+one JSON object: the bridge forces streaming upstream and reassembles the
+stream.
+
+The genuine `opencode` CLI also works pointed at the bridge: merge
+`{"provider":{"opencode":{"options":{"baseURL":"http://HOST:8593/v1"}}}}` into
+`~/.config/opencode/opencode.json`. Values the client sends (its own session
+id, its User-Agent) are respected and never overwritten on the first attempt.
+
+When the upstream answers 429 with a `FreeUsageLimitError`, the bridge rotates
+the WARP exit (next account's fresh session in round-robin mode) and replays
+the request byte-for-byte, rate-limited. If the WARP retries run out, the
+optional public proxy pool is the last-resort exit.
+
+## Exit-IP multiplication
+
+Measured behaviour: the WARP egress IP keys on the tunnel session, not on the
+account or the endpoint. Simultaneous tunnels share one egress; each fresh
+session draws from the small pool of the datacenter the machine sits in.
+warp-proxy therefore offers four levers:
+
+- **Account pool** (`warp.accounts: N`): N identities; reconnects rotate
+  through them. With `warp.distribution: round-robin` every account keeps a
+  live tunnel and requests spread across them per request.
+- **IPv6 egress** (`warp.ipv6_preference: prefer`): hostnames with an AAAA
+  record exit through WARP's separate IPv6 egress space instead of the small
+  per-colo IPv4 pool. `off` (default) resolves A records only; `only`
+  resolves AAAA only. Applies live.
+- **Egress dedupe**: in round-robin mode a bounded pass measures every
+  tunnel's real exit IP and refreshes colliding workers through the rate
+  limiter (startup, plus the panel button). Collisions it cannot resolve are
+  shown on the dashboard instead of breaking the pool.
+- **Public proxy fallback** (`public_proxy:` section): scraped and verified
+  public proxies used only after the WARP retries are exhausted. Sources,
+  interval, cap and the check URL are configurable; the panel page shows the
+  pool and triggers scans.
+
 ## Configuration
 
-`config.example.yaml` documents every setting. The panel can edit health
-targets, bot markers, reconnect mode and rate limits at runtime; listener
-ports and the warp-cli binary need a restart.
+`config.example.yaml` documents every setting. The panel edits reconnect
+mode, IPv6 preference, rate limits, health targets, bot markers, front rules,
+and the bridge upstream and retry settings at runtime; listener ports,
+`warp.state_dir`, `warp.accounts`, `warp.distribution` and the whole
+`public_proxy` section need a restart (the panel's Public Proxy page shows
+the pool and triggers scans at any time).
+
+Key sections:
+
+```yaml
+warp:
+  state_dir: "state"
+  accounts: 3                    # identity pool
+  reconnect_mode: "reconnect"    # or "reregister" (delete + fresh registration)
+  distribution: "round-robin"    # or "off" (single active tunnel)
+  ipv6_preference: "prefer"      # off | prefer | only
+
+public_proxy:
+  enabled: true
+  interval: "30m"
+  max: 100
+```
 
 ## Development
 
 ```sh
 make vet
-make test   # unit tests; proxy and health tests use fake upstreams
+make test   # unit tests, fully offline
 ```
 
-macOS has no warp-cli service, so end-to-end runs happen in Docker.
+Live MASQUE tests are gated behind `MASQUE_LIVE=1` and must run where the
+network allows MASQUE traffic (the maintainer's local network drops it): the
+unit build is cross-compiled, copied into the deployment container and run
+with `MASQUE_STATE` pointing at the identity directory. After a code change
+run ripwire `quality_delta` and `test-gate`.
 
 ## Notes
 
-- The container needs `privileged: true` because the WARP client creates a
-  tunnel interface.
-- A reconnect does not always change the exit address. If the flag persists,
-  switch the reconnect mode to `reregister` in the panel.
+- The MASQUE protocol is Cloudflare's undocumented consumer protocol; a
+  protocol change breaks this client and detecting it is our job. The health
+  check doubles as the alarm.
+- A reconnect does not always change the exit address: addresses come from a
+  small pool and repeats are normal. The dashboard's per-account readout and
+  the dedupe pass exist to make that visible.
+- The public proxy pool is third-party infrastructure: treat its exits as
+  untrusted and keep it as a fallback, not as the primary path.
