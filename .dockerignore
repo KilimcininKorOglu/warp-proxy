@@ -1,6 +1,9 @@
 bin/
 .env
-config/config.yaml
 state/
+config/
 *.md
 helper-projects/
+.git
+.github
+.dockerignore
