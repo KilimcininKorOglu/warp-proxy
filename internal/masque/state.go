@@ -12,13 +12,16 @@ import (
 // Identity is one registered WARP device: the enrolled key, the API token and
 // everything the tunnel needs. It is persisted as JSON in the state directory.
 type Identity struct {
-	PrivateKey    string `json:"private_key"`
-	AccessToken   string `json:"access_token"`
-	ID            string `json:"id"`
-	EndpointV4    string `json:"endpoint_v4"`
-	EndpointV6    string `json:"endpoint_v6"`
-	EndpointH2V4  string `json:"endpoint_h2_v4"`
-	EndpointV6H2  string `json:"endpoint_h2_v6"`
+	PrivateKey   string `json:"private_key"`
+	AccessToken  string `json:"access_token"`
+	ID           string `json:"id"`
+	EndpointV4   string `json:"endpoint_v4"`
+	EndpointV6   string `json:"endpoint_v6"`
+	EndpointH2V4 string `json:"endpoint_h2_v4"`
+	EndpointV6H2 string `json:"endpoint_h2_v6"`
+	// EndpointPorts are the CONNECT-IP service ports of the home edge, as
+	// listed by the registration response (e.g. 443, 500, 1701, 4500).
+	EndpointPorts []int  `json:"endpoint_ports"`
 	PeerPubKeyPEM string `json:"endpoint_pub_key"`
 	IPv4          string `json:"ipv4"`
 	IPv6          string `json:"ipv6"`

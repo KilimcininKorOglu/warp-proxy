@@ -35,10 +35,12 @@ const (
 	// h3SettingDatagram00 is the legacy H3 datagram setting id the official
 	// client still advertises.
 	h3SettingDatagram00 = 0x276
-	// MaxIPPacket bounds the packet handed to a tunnel's SendIP. Over H3 it
-	// is the QUIC datagram budget (~1222) minus the context-id varint; over
-	// H2 it stays under a typical TCP segment.
-	MaxIPPacket = 1200
+	// MaxIPPacket bounds the packet handed to a tunnel's SendIP: the QUIC
+	// datagram budget at InitialPacketSize 1350 (the warp-svc value) minus
+	// headers and the context-id varint, matching mihomo's 1280 MTU.
+	MaxIPPacket = 1280
+	// initialPacketSize is the QUIC initial packet size warp-svc uses.
+	initialPacketSize = 1350
 )
 
 // Tunnel is an established MASQUE CONNECT-IP session over either transport.
@@ -138,9 +140,10 @@ func dialH3(ctx context.Context, id *Identity, conf *tls.Config,
 	tlsConf := conf.Clone()
 	tlsConf.NextProtos = []string{"h3"}
 	quicConf := &quic.Config{
-		EnableDatagrams: true,
-		KeepAlivePeriod: 15 * time.Second,
-		MaxIdleTimeout:  30 * time.Second,
+		EnableDatagrams:   true,
+		InitialPacketSize: initialPacketSize,
+		KeepAlivePeriod:   15 * time.Second,
+		MaxIdleTimeout:    30 * time.Second,
 	}
 	// The backend intermittently emits PROTOCOL_VIOLATION unless the client
 	// uses 20-byte source connection IDs, so pin the generator length.

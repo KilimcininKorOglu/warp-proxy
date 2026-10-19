@@ -106,7 +106,19 @@ func main() {
 		applyLimiter(c, checker)
 	}
 	panel.Scanner = func(ctx context.Context, c *config.Config) ([]cleanip.Result, error) {
-		results, err := web.RunScan(ctx, c)
+		// MASQUE binds a registration to its home edge: scan the home
+		// edge's service ports instead of random Cloudflare addresses.
+		var results []cleanip.Result
+		var err error
+		if host, ports, ok := manager.HomeEdge(); ok {
+			timeout := 2 * time.Second
+			if d, perr := config.ParseDuration(c.CleanIP.Timeout); perr == nil {
+				timeout = d
+			}
+			results = cleanip.ScanHostPorts(ctx, host, ports, timeout, c.CleanIP.Top)
+		} else {
+			results, err = web.RunScan(ctx, c)
+		}
 		if err == nil {
 			selector.SetPool(results)
 		}

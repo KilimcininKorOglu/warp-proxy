@@ -207,6 +207,10 @@ func buildIdentity(kp *DeviceKeypair, token string, acc *apiAccount) (*Identity,
 		return nil, err
 	}
 	peer := acc.Config.Peers[0]
+	ports := peer.Endpoint.Ports
+	if len(ports) == 0 {
+		ports = []int{443}
+	}
 	return &Identity{
 		PrivateKey:    priv,
 		AccessToken:   token,
@@ -214,6 +218,7 @@ func buildIdentity(kp *DeviceKeypair, token string, acc *apiAccount) (*Identity,
 		EndpointV4:    stripPort(peer.Endpoint.V4),
 		EndpointV6:    stripPort(peer.Endpoint.V6),
 		EndpointH2V4:  DefaultEndpointH2,
+		EndpointPorts: ports,
 		PeerPubKeyPEM: peer.PublicKey,
 		IPv4:          acc.Config.Interface.Addresses.V4,
 		IPv6:          acc.Config.Interface.Addresses.V6,
@@ -236,8 +241,9 @@ type apiAccount struct {
 		Peers []struct {
 			PublicKey string `json:"public_key"`
 			Endpoint  struct {
-				V4 string `json:"v4"`
-				V6 string `json:"v6"`
+				V4    string `json:"v4"`
+				V6    string `json:"v6"`
+				Ports []int  `json:"ports"`
 			} `json:"endpoint"`
 		} `json:"peers"`
 		Interface struct {

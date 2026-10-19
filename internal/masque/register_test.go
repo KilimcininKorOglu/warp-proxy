@@ -48,7 +48,8 @@ func fakeAPI(t *testing.T, realPEM string) (*httptest.Server, *[]apiCall) {
 			t.Errorf("enroll key is %T, want *ecdsa.PublicKey", pub)
 		}
 		fmt.Fprintf(w, `{"id":"dev-1","config":{
-			"peers":[{"public_key":%q,"endpoint":{"v4":"162.159.198.1:0","v6":"[2606:4700:103::]:0"}}],
+			"peers":[{"public_key":%q,"endpoint":{"v4":"162.159.198.1:0","v6":"[2606:4700:103::]:0",
+			"ports":[443,500,1701,4500]}}],
 			"interface":{"addresses":{"v4":"100.96.0.3/32","v6":"2606:4700:110::1/128"}}}}`,
 			realPEM)
 	}))
@@ -93,6 +94,15 @@ func TestRegisterFlow(t *testing.T) {
 	}
 	if id.PeerPubKeyPEM != realPEM {
 		t.Error("peer public key not carried through")
+	}
+	wantPorts := []int{443, 500, 1701, 4500}
+	if len(id.EndpointPorts) != len(wantPorts) {
+		t.Fatalf("endpoint ports = %v, want %v", id.EndpointPorts, wantPorts)
+	}
+	for i, p := range wantPorts {
+		if id.EndpointPorts[i] != p {
+			t.Errorf("port[%d] = %d, want %d", i, id.EndpointPorts[i], p)
+		}
 	}
 	// The identity must restore into the keypair whose key was enrolled.
 	kp, err := id.Keypair()

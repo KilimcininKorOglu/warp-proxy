@@ -115,7 +115,11 @@ func TestProtocolConstants(t *testing.T) {
 	if ConnectURI != "https://cloudflareaccess.com" {
 		t.Errorf("ConnectURI = %q", ConnectURI)
 	}
-	if MaxIPPacket > 1221 {
-		t.Errorf("MaxIPPacket = %d, exceeds the QUIC datagram budget", MaxIPPacket)
+	// 1280 matches mihomo's tunnel MTU at InitialPacketSize 1350.
+	if MaxIPPacket != 1280 {
+		t.Errorf("MaxIPPacket = %d, want 1280", MaxIPPacket)
+	}
+	if initialPacketSize != 1350 {
+		t.Errorf("initialPacketSize = %d, want 1350", initialPacketSize)
 	}
 }

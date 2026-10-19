@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -110,4 +111,55 @@ func portOf(t *testing.T, url string) int {
 		t.Fatalf("no port in %q: %v", url, err)
 	}
 	return port
+}
+
+func TestScanHostPortsRanksAndFormats(t *testing.T) {
+	// One listener per port on the loopback host: the "home edge" stand-in.
+	ln443, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln443.Close()
+	ln8443, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln8443.Close()
+	go accept(ln443)
+	go accept(ln8443)
+
+	host := "127.0.0.1"
+	p443 := lnPort(ln443)
+	p8443 := lnPort(ln8443)
+	results := ScanHostPorts(context.Background(), host,
+		[]int{p443, p8443, 1 /* closed: filtered out */}, time.Second, 0)
+	if len(results) != 2 {
+		t.Fatalf("results = %+v, want 2 reachable", results)
+	}
+	for _, r := range results {
+		if !strings.HasPrefix(r.IP, host+":") {
+			t.Errorf("result IP = %q, want host:port", r.IP)
+		}
+	}
+	if results[0].Latency > results[1].Latency {
+		t.Error("results not sorted by latency")
+	}
+	// Top truncates.
+	if got := ScanHostPorts(context.Background(), host, []int{p443}, time.Second, 0); len(got) != 1 {
+		t.Errorf("single-port scan = %d results", len(got))
+	}
+}
+
+func accept(ln net.Listener) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		conn.Close()
+	}
+}
+
+func lnPort(ln net.Listener) int {
+	return ln.Addr().(*net.TCPAddr).Port
 }

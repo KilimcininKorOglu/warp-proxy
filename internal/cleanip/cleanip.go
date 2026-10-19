@@ -169,3 +169,37 @@ func Scan(ctx context.Context, params Params, ranges []string) []Result {
 	}
 	return reachable
 }
+
+// ScanHostPorts probes the CONNECT-IP service ports of one host (the
+// registration's home edge) and ranks the reachable ones. The returned
+// Result.IP is "host:port", ready to use as a pinned endpoint: MASQUE binds
+// a registration to its home edge, so scans must not wander to other
+// Cloudflare addresses.
+func ScanHostPorts(ctx context.Context, host string, ports []int,
+	timeout time.Duration, top int) []Result {
+	results := make(chan Result, len(ports))
+	var wg sync.WaitGroup
+	for _, port := range ports {
+		wg.Go(func() {
+			if latency, err := Probe(ctx, host, port, timeout); err == nil {
+				results <- Result{IP: net.JoinHostPort(host, strconv.Itoa(port)),
+					Latency: latency}
+			}
+		})
+	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	var reachable []Result
+	for r := range results {
+		reachable = append(reachable, r)
+	}
+	sort.Slice(reachable, func(i, j int) bool {
+		return reachable[i].Latency < reachable[j].Latency
+	})
+	if top > 0 && len(reachable) > top {
+		reachable = reachable[:top]
+	}
+	return reachable
+}

@@ -347,6 +347,24 @@ func (m *Manager) connectTunnel(ctx context.Context, id *masque.Identity,
 	return tun, nd, nil
 }
 
+// HomeEdge returns the active identity's registration edge host and its
+// CONNECT-IP service ports. MASQUE binds a registration to this edge, so
+// endpoint scans must stay on it; ok is false without a loaded identity.
+func (m *Manager) HomeEdge() (host string, ports []int, ok bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, w := range m.workers {
+		if w != nil && w.id != nil && w.id.EndpointV4 != "" {
+			ports := w.id.EndpointPorts
+			if len(ports) == 0 {
+				ports = []int{443}
+			}
+			return w.id.EndpointV4, ports, true
+		}
+	}
+	return "", nil, false
+}
+
 // SetHooks installs test doubles for registration and connecting. Nil hooks
 // mean the real implementations; production code never calls this.
 func (m *Manager) SetHooks(register IdentityFunc, connect ConnectFunc) {
