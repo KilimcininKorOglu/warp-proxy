@@ -11,7 +11,7 @@ import (
 )
 
 // Upstream dials target addresses through its DialFunc: the WARP tunnel's
-// netstack. It replaces the former SOCKS5 hop to warp-cli.
+// netstack.
 type Upstream struct {
 	// DialFunc connects to "host:port" through the tunnel. Hostnames are
 	// resolved remotely, inside the tunnel.

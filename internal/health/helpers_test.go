@@ -20,7 +20,7 @@ func writeFile(path, body string) error {
 }
 
 // fakeUpstream is a minimal HTTP CONNECT proxy the checker dials through,
-// standing in for the warp-cli proxy.
+// standing in for the WARP tunnel.
 func fakeUpstream(t *testing.T) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

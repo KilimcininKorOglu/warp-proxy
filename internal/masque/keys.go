@@ -1,7 +1,7 @@
 // Package masque implements the Cloudflare WARP MASQUE client: device
 // registration, the CONNECT-IP tunnel, and the identity state store. It is
 // the Go port of the protocol documented in the clean-room reference
-// (github.com/akumaginkou/warp-proxy, DESIGN.md) and replaces warp-cli.
+// (github.com/akumaginkou/warp-proxy, DESIGN.md).
 package masque
 
 import (

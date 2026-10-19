@@ -2,8 +2,8 @@
 
 warp-proxy routes all client traffic through Cloudflare WARP and serves the
 OpenCode free tier through an OpenAI- and Anthropic-compatible AI bridge. It
-implements WARP's MASQUE protocol in-process — there is no `warp-cli`, no
-`warp-svc`, no tun device, and the container runs unprivileged. One Go binary
+implements WARP's MASQUE protocol in-process: no external WARP client, no
+daemon, no tun device, and the container runs unprivileged. One Go binary
 exposes an HTTP proxy, a SOCKS5 proxy, the AI bridge and a Turkish admin web
 panel.
 

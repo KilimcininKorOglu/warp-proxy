@@ -7,8 +7,8 @@
       <td>{{if not .Health.Enabled}}<span class="pill warn">Health-check kapalı</span>
       {{else if .Health.Healthy}}<span class="pill ok">Sağlıklı</span>
       {{else}}<span class="pill err">Sorunlu</span>{{end}}</td></tr>
-    <tr><th>warp-cli</th>
-      <td>{{if .WarpError}}<span class="pill err">warp-cli hatası</span>{{end}}
+    <tr><th>Tünel</th>
+      <td>{{if .WarpError}}<span class="pill err">tünel hatası</span>{{end}}
       <span class="log">{{.WarpStatus}}</span></td></tr>
     <tr><th>Çıkış IP</th><td>{{if .Health.ExitIP}}{{.Health.ExitIP}}{{else}}<span class="muted">henüz ölçülmedi</span>{{end}}</td></tr>
     <tr><th>WARP</th><td>{{if .Health.WarpOn}}<span class="pill ok">warp=on</span>{{else}}<span class="pill warn">warp=off / bilinmiyor</span>{{end}}</td></tr>

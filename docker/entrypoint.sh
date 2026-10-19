@@ -1,6 +1,6 @@
 #!/bin/sh
 # Entrypoint: seed the config, then run the Go binary. The MASQUE client
-# registers and connects in-process; no warp-svc, no tun device, no
+# registers and connects in-process; no daemon, no tun device, no
 # privileges. The WARP identity lives in the state directory on the mounted
 # volume, so the registration step is skipped when one already exists.
 set -e

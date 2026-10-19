@@ -1,6 +1,6 @@
 // Package warp owns the WARP tunnel lifecycle: identity registration, the
-// MASQUE tunnels and the netstack dialers the proxies route through. It
-// replaces the warp-cli driver and supports a multi-account pool.
+// MASQUE tunnels and the netstack dialers the proxies route through, with a
+// multi-account pool.
 package warp
 
 import (

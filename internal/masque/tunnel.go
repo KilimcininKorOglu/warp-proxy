@@ -36,10 +36,12 @@ const (
 	// client still advertises.
 	h3SettingDatagram00 = 0x276
 	// MaxIPPacket bounds the packet handed to a tunnel's SendIP: the QUIC
-	// datagram budget at InitialPacketSize 1350 (the warp-svc value) minus
-	// headers and the context-id varint, matching mihomo's 1280 MTU.
+	// datagram budget at InitialPacketSize 1350 (the official client's
+	// value) minus headers and the context-id varint, matching mihomo's
+	// 1280 MTU.
 	MaxIPPacket = 1280
-	// initialPacketSize is the QUIC initial packet size warp-svc uses.
+	// initialPacketSize is the QUIC initial packet size the official
+	// client uses.
 	initialPacketSize = 1350
 )
 

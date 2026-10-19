@@ -9,7 +9,7 @@ http_proxy:
 socks_proxy:
   listen: ":8592"
 
-# Built-in MASQUE tunnel (no warp-cli).
+# Built-in MASQUE tunnel.
 warp:
   state_dir: "state"            # device identities, persisted across restarts
   accounts: 1                   # >1 enables the multi-account pool; needs a restart
