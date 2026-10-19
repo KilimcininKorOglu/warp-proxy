@@ -238,6 +238,10 @@ func applyForm(cfg *config.Config, r *http.Request) {
 	if cfg.Warp.ReconnectMode != warp.ModeReregister {
 		cfg.Warp.ReconnectMode = warp.ModeReconnect
 	}
+	cfg.Warp.Distribution = r.FormValue("warp_distribution")
+	if cfg.Warp.Distribution != warp.DistributionRoundRobin {
+		cfg.Warp.Distribution = warp.DistributionOff
+	}
 	cfg.Health.Enabled = r.FormValue("health_enabled") == "on"
 	cfg.Health.Interval = formOr(r, "health_interval", cfg.Health.Interval)
 	cfg.Health.Timeout = formOr(r, "health_timeout", cfg.Health.Timeout)

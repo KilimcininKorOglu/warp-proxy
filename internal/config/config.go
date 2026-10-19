@@ -109,6 +109,10 @@ type WarpConfig struct {
 	// ReconnectMode is "reconnect" (close and reopen the tunnel) or
 	// "reregister" (delete registration, register again, connect).
 	ReconnectMode string `yaml:"reconnect_mode"`
+	// Distribution is "off" (one active tunnel, rotation on reconnect) or
+	// "round-robin" (every account keeps a live tunnel and requests
+	// spread across them per request). Needs a restart to change.
+	Distribution string `yaml:"distribution"`
 }
 
 // HealthConfig configures the periodic health check through the WARP proxy.
@@ -148,6 +152,7 @@ func Defaults() *Config {
 			StateDir:      "state",
 			Accounts:      1,
 			ReconnectMode: "reconnect",
+			Distribution:  "off",
 		},
 		Health: HealthConfig{
 			Enabled:  true,

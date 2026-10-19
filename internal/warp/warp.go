@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"warp-proxy/internal/masque"
@@ -21,6 +22,16 @@ import (
 const (
 	ModeReconnect  = "reconnect"
 	ModeReregister = "reregister"
+)
+
+// Request distribution modes.
+const (
+	// DistributionOff keeps a single active tunnel; rotation happens only
+	// on Reconnect.
+	DistributionOff = "off"
+	// DistributionRoundRobin keeps every account's tunnel open and
+	// spreads requests across them one by one.
+	DistributionRoundRobin = "round-robin"
 )
 
 // Tunnel is the piece of the MASQUE tunnel the manager needs: teardown.
@@ -66,22 +77,45 @@ type Manager struct {
 	register IdentityFunc
 	connect  ConnectFunc
 
-	mu       sync.RWMutex
-	workers  []*worker
-	active   int    // the worker owning the live tunnel
-	endpoint string // pin override applied at the next (re)connect
-	last     time.Time
+	mu           sync.RWMutex
+	workers      []*worker
+	active       int    // the worker owning the live tunnel (off mode)
+	endpoint     string // pin override applied at the next (re)connect
+	last         time.Time
+	distribution string // DistributionOff or DistributionRoundRobin
+	rrCounter    atomic.Uint64
 }
 
 // NewManager builds a Manager persisting identity state under stateDir and
-// rotating across accounts accounts.
-func NewManager(stateDir string, reconnectMode string, accounts int) *Manager {
+// rotating across accounts accounts. distribution selects DistributionOff
+// (default) or DistributionRoundRobin; anything else falls back to off.
+func NewManager(stateDir string, reconnectMode string, accounts int,
+	distribution string) *Manager {
 	if accounts < 1 {
 		accounts = 1
 	}
 	m := &Manager{stateDir: stateDir, accounts: accounts}
 	m.SetMode(reconnectMode)
+	m.SetDistribution(distribution)
 	return m
+}
+
+// SetDistribution switches the request distribution mode; anything other
+// than DistributionRoundRobin falls back to DistributionOff.
+func (m *Manager) SetDistribution(mode string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if mode != DistributionRoundRobin {
+		mode = DistributionOff
+	}
+	m.distribution = mode
+}
+
+// Distribution reports the request distribution mode.
+func (m *Manager) Distribution() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.distribution
 }
 
 // ReconnectMode reports the configured reconnect mode.
@@ -105,24 +139,60 @@ func (m *Manager) LastReconnect() time.Time {
 	return m.last
 }
 
-// Dial routes a connection through the active tunnel's netstack. It
-// implements the proxy.Upstream contract.
+// Dial routes a connection through the tunnel pool. Off mode uses the
+// active tunnel; round-robin advances one worker per call. It implements
+// the proxy.Upstream contract.
 func (m *Manager) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	d, err := m.requestDialer()
+	if err != nil {
+		return nil, err
+	}
+	return d.Dial(ctx, network, addr)
+}
+
+// ResolveIP resolves a hostname through the pool's remote DNS, picked by
+// the same distribution rule as Dial.
+func (m *Manager) ResolveIP(ctx context.Context, host string) (net.IP, error) {
+	d, err := m.requestDialer()
+	if err != nil {
+		return nil, ErrNotConnected
+	}
+	ip, rerr := d.Resolve(ctx, host)
+	return ip, wrapResolve(host, ip, rerr)
+}
+
+// requestDialer picks the dialer for one request according to the
+// distribution mode.
+func (m *Manager) requestDialer() (Dialer, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.distribution == DistributionRoundRobin {
+		if d := m.rrDialerLocked(); d != nil {
+			return d, nil
+		}
+		return nil, ErrNotConnected
+	}
 	w, err := m.activeWorker()
 	if err != nil {
 		return nil, err
 	}
-	return w.d.Dial(ctx, network, addr)
+	return w.d, nil
 }
 
-// ResolveIP resolves a hostname through the active tunnel's remote DNS.
-func (m *Manager) ResolveIP(ctx context.Context, host string) (net.IP, error) {
-	w, werr := m.activeWorker()
-	if w == nil || werr != nil {
-		return nil, ErrNotConnected
+// rrDialerLocked returns the next live worker's dialer, skipping dead
+// workers so a failed tunnel does not break the round-robin.
+func (m *Manager) rrDialerLocked() Dialer {
+	n := len(m.workers)
+	if n == 0 {
+		return nil
 	}
-	ip, rerr := w.d.Resolve(ctx, host)
-	return ip, wrapResolve(host, ip, rerr)
+	start := int(m.rrCounter.Add(1)) - 1
+	for i := 0; i < n; i++ {
+		if w := m.workers[(start+i)%n]; w != nil && w.d != nil {
+			return w.d
+		}
+	}
+	return nil
 }
 
 // wrapResolve annotates a resolver failure with the queried host.
@@ -136,12 +206,16 @@ func wrapResolve(host string, ip net.IP, err error) error {
 	return nil
 }
 
-// EnsureReady brings the active account's tunnel up, keeping existing
-// registrations and a tunnel that is already live.
+// EnsureReady brings the pool up, keeping existing registrations and any
+// tunnel that is already live. Off mode connects only the active account;
+// round-robin connects every account.
 func (m *Manager) EnsureReady(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.ensureWorkersLocked()
+	if m.distribution == DistributionRoundRobin {
+		return m.forWorkersLocked(ctx, true)
+	}
 	if m.activeWorkerLocked() != nil {
 		return nil
 	}
@@ -152,10 +226,18 @@ func (m *Manager) EnsureReady(ctx context.Context) error {
 // the tunnel (reregister mode deletes the registration first). With a pool
 // it opens the next identity's fresh session — which Cloudflare answers
 // with the next egress IP — and closes the previous tunnel only after the
-// new one is up, so a failed rotation keeps the old egress working.
+// new one is up, so a failed rotation keeps the old egress working. In
+// round-robin mode it refreshes every live tunnel's session instead.
 func (m *Manager) Reconnect(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.distribution == DistributionRoundRobin {
+		if err := m.forWorkersLocked(ctx, false); err != nil {
+			return err
+		}
+		m.last = time.Now()
+		return nil
+	}
 	next := m.active
 	if m.poolSize() > 1 {
 		next = (m.active + 1) % m.poolSize()
@@ -172,16 +254,51 @@ func (m *Manager) Reconnect(ctx context.Context) error {
 	return nil
 }
 
-// SetEndpoint pins the tunnel to a custom edge endpoint ("host:port") and
-// reconnects the active account so the change takes effect.
+// SetEndpoint pins the tunnels to a custom edge endpoint ("host:port") and
+// reconnects so the change takes effect: the active account in off mode,
+// every account in round-robin mode.
 func (m *Manager) SetEndpoint(ctx context.Context, endpoint string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.endpoint = endpoint
+	if m.distribution == DistributionRoundRobin {
+		if err := m.forWorkersLocked(ctx, false); err != nil {
+			return err
+		}
+		m.last = time.Now()
+		return nil
+	}
 	if err := m.connectLocked(ctx, m.active, endpoint); err != nil {
 		return err
 	}
 	m.last = time.Now()
+	return nil
+}
+
+// forWorkersLocked connects every worker's tunnel. With skipLive it keeps
+// tunnels that are already up (EnsureReady); without it every worker gets
+// a fresh session (Reconnect, SetEndpoint). It fails only when no tunnel
+// comes up at all, so a single bad account cannot take the pool down.
+func (m *Manager) forWorkersLocked(ctx context.Context, skipLive bool) error {
+	var firstErr error
+	up := 0
+	for i := range m.workers {
+		if w := m.workers[i]; skipLive && w != nil && w.d != nil {
+			up++
+			continue
+		}
+		if err := m.connectLocked(ctx, i, m.endpoint); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			h2Debug("worker %d connect failed: %v", i, err)
+			continue
+		}
+		up++
+	}
+	if up == 0 && firstErr != nil {
+		return firstErr
+	}
 	return nil
 }
 
@@ -195,18 +312,37 @@ func (m *Manager) Connected(_ context.Context) (bool, error) {
 func (m *Manager) Status(_ context.Context) (string, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if m.activeWorkerLocked() == nil {
-		return "disconnected", nil
-	}
 	ep := m.endpoint
 	if ep == "" {
 		ep = "default edge"
+	}
+	if m.distribution == DistributionRoundRobin {
+		live := m.liveCountLocked()
+		if live == 0 {
+			return "disconnected", nil
+		}
+		return fmt.Sprintf("connected (MASQUE, round-robin %d/%d tunnels, endpoint %s)",
+			live, m.poolSize(), ep), nil
+	}
+	if m.activeWorkerLocked() == nil {
+		return "disconnected", nil
 	}
 	if m.poolSize() == 1 {
 		return fmt.Sprintf("connected (MASQUE, endpoint %s)", ep), nil
 	}
 	return fmt.Sprintf("connected (MASQUE, account %d/%d, endpoint %s)",
 		m.active+1, m.poolSize(), ep), nil
+}
+
+// liveCountLocked counts the workers holding a live tunnel.
+func (m *Manager) liveCountLocked() int {
+	n := 0
+	for _, w := range m.workers {
+		if w != nil && w.d != nil {
+			n++
+		}
+	}
+	return n
 }
 
 // activeWorker returns the worker that owns the live tunnel.

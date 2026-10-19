@@ -3,6 +3,7 @@ package warp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -17,7 +18,7 @@ func TestEnsureReadyRegistersOnceAndConnects(t *testing.T) {
 	dir := t.TempDir()
 	var registers atomic.Int32
 	var attempts atomic.Int32
-	m := NewManager(dir, ModeReconnect, 1)
+	m := NewManager(dir, ModeReconnect, 1, DistributionOff)
 	m.register = func(context.Context) (*masque.Identity, error) {
 		registers.Add(1)
 		return testIdentity(), nil
@@ -53,7 +54,7 @@ func TestEnsureReadyRegistersOnceAndConnects(t *testing.T) {
 func TestReconnectModesSwapTunnel(t *testing.T) {
 	dir := t.TempDir()
 	var attempts, oldClosed atomic.Int32
-	m := NewManager(dir, ModeReconnect, 1)
+	m := NewManager(dir, ModeReconnect, 1, DistributionOff)
 	m.connect = func(context.Context, *masque.Identity,
 		string) (Tunnel, Dialer, error) {
 		attempts.Add(1)
@@ -85,7 +86,7 @@ func TestSetEndpointPinsOverride(t *testing.T) {
 	dir := t.TempDir()
 	var endpoints []string
 	var attempts atomic.Int32
-	m := NewManager(dir, ModeReconnect, 1)
+	m := NewManager(dir, ModeReconnect, 1, DistributionOff)
 	m.connect = func(_ context.Context, _ *masque.Identity,
 		endpoint string) (Tunnel, Dialer, error) {
 		attempts.Add(1)
@@ -107,14 +108,14 @@ func TestSetEndpointPinsOverride(t *testing.T) {
 }
 
 func TestDialWithoutTunnelFails(t *testing.T) {
-	m := NewManager(t.TempDir(), ModeReconnect, 1)
+	m := NewManager(t.TempDir(), ModeReconnect, 1, DistributionOff)
 	if _, err := m.Dial(context.Background(), "tcp", "example.com:80"); !errors.Is(err, ErrNotConnected) {
 		t.Errorf("Dial err = %v, want ErrNotConnected", err)
 	}
 }
 
 func TestModeFallback(t *testing.T) {
-	m := NewManager(t.TempDir(), "bogus", 1)
+	m := NewManager(t.TempDir(), "bogus", 1, DistributionOff)
 	if m.ReconnectMode() != ModeReconnect {
 		t.Errorf("mode = %q, want reconnect fallback", m.ReconnectMode())
 	}
@@ -165,7 +166,7 @@ func (fakeDialer) Resolve(context.Context, string) (net.IP, error) {
 func TestPoolRotationUsesFreshSession(t *testing.T) {
 	dir := t.TempDir()
 	var attempts, oldClosed atomic.Int32
-	m := NewManager(dir, ModeReconnect, 3)
+	m := NewManager(dir, ModeReconnect, 3, DistributionOff)
 	m.register = func(context.Context) (*masque.Identity, error) {
 		return testIdentity(), nil
 	}
@@ -207,7 +208,7 @@ func TestPoolRotationUsesFreshSession(t *testing.T) {
 func TestPoolKeepsOldTunnelOnFailedRotation(t *testing.T) {
 	dir := t.TempDir()
 	var attempts, oldClosed atomic.Int32
-	m := NewManager(dir, ModeReconnect, 2)
+	m := NewManager(dir, ModeReconnect, 2, DistributionOff)
 	m.register = func(context.Context) (*masque.Identity, error) {
 		return testIdentity(), nil
 	}
@@ -233,9 +234,123 @@ func TestPoolKeepsOldTunnelOnFailedRotation(t *testing.T) {
 	}
 }
 
+// taggedDialer marks every dial with its worker index so tests can see
+// which tunnel served a request.
+type taggedDialer struct{ tag string }
+
+func (d taggedDialer) Dial(context.Context, string, string) (net.Conn, error) {
+	return nil, errors.New(d.tag)
+}
+
+func (d taggedDialer) Resolve(context.Context, string) (net.IP, error) {
+	return nil, errors.New(d.tag)
+}
+
+func TestRoundRobinDialCyclesWorkers(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir, ModeReconnect, 3, DistributionRoundRobin)
+	m.register = func(context.Context) (*masque.Identity, error) {
+		return testIdentity(), nil
+	}
+	m.connect = func(_ context.Context, _ *masque.Identity,
+		_ string) (Tunnel, Dialer, error) {
+		return &countingTunnel{}, nil, nil
+	}
+	if err := m.EnsureReady(context.Background()); err != nil {
+		t.Fatalf("EnsureReady: %v", err)
+	}
+	// Install tagged dialers after connect so each worker is identifiable.
+	for i, w := range m.workers {
+		w.d = taggedDialer{tag: fmt.Sprintf("worker-%d", i)}
+	}
+
+	var got []string
+	for i := 0; i < 3; i++ {
+		_, err := m.Dial(context.Background(), "tcp", "example.com:80")
+		if err == nil {
+			t.Fatal("dial unexpectedly succeeded on a fake dialer")
+		}
+		got = append(got, err.Error())
+	}
+	want := []string{"worker-0", "worker-1", "worker-2"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("dials = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestRoundRobinSkipsDeadWorkers(t *testing.T) {
+	dir := t.TempDir()
+	var attempts atomic.Int32
+	m := NewManager(dir, ModeReconnect, 3, DistributionRoundRobin)
+	m.register = func(context.Context) (*masque.Identity, error) {
+		return testIdentity(), nil
+	}
+	m.connect = func(_ context.Context, _ *masque.Identity,
+		_ string) (Tunnel, Dialer, error) {
+		// Worker 1's tunnel never comes up.
+		if attempts.Add(1) == 2 {
+			return nil, nil, errors.New("worker 1 fails")
+		}
+		return &countingTunnel{}, nil, nil
+	}
+	if err := m.EnsureReady(context.Background()); err != nil {
+		t.Fatalf("EnsureReady: %v (one dead worker must not fail the pool)", err)
+	}
+	m.workers[0].d = taggedDialer{tag: "worker-0"}
+	m.workers[2].d = taggedDialer{tag: "worker-2"}
+
+	// The dead worker is skipped (never served) but consumes its tick, so
+	// the served sequence is 0, 2, 2, ...
+	for i, want := range []string{"worker-0", "worker-2", "worker-2"} {
+		_, err := m.Dial(context.Background(), "tcp", "example.com:80")
+		if err == nil || err.Error() != want {
+			t.Fatalf("dial %d = %v, want %s", i, err, want)
+		}
+	}
+}
+
+func TestRoundRobinReconnectRefreshesAll(t *testing.T) {
+	dir := t.TempDir()
+	var attempts atomic.Int32
+	m := NewManager(dir, ModeReconnect, 3, DistributionRoundRobin)
+	m.register = func(context.Context) (*masque.Identity, error) {
+		return testIdentity(), nil
+	}
+	m.connect = func(context.Context, *masque.Identity,
+		string) (Tunnel, Dialer, error) {
+		attempts.Add(1)
+		return &countingTunnel{}, &fakeDialer{}, nil
+	}
+	if err := m.EnsureReady(context.Background()); err != nil {
+		t.Fatalf("EnsureReady: %v", err)
+	}
+	if attempts.Load() != 3 {
+		t.Fatalf("EnsureReady connects = %d, want 3", attempts.Load())
+	}
+	if err := m.Reconnect(context.Background()); err != nil {
+		t.Fatalf("Reconnect: %v", err)
+	}
+	if attempts.Load() != 6 {
+		t.Errorf("connects after Reconnect = %d, want 6 (every tunnel refreshed)", attempts.Load())
+	}
+	st, err := m.Status(context.Background())
+	if err != nil || !strings.Contains(st, "round-robin 3/3") {
+		t.Errorf("status = %q, %v; want round-robin 3/3", st, err)
+	}
+}
+
+func TestDistributionFallback(t *testing.T) {
+	m := NewManager(t.TempDir(), ModeReconnect, 1, "bogus")
+	if m.Distribution() != DistributionOff {
+		t.Errorf("distribution = %q, want off fallback", m.Distribution())
+	}
+}
+
 func TestHomeEdgeFromActiveIdentity(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir, ModeReconnect, 1)
+	m := NewManager(dir, ModeReconnect, 1, DistributionOff)
 	m.register = func(context.Context) (*masque.Identity, error) {
 		id := testIdentity()
 		id.EndpointV4 = "162.159.198.2"
