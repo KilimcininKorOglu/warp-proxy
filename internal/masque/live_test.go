@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -345,6 +346,85 @@ func TestLiveEgressPerEndpoint(t *testing.T) {
 		tun.Close()
 		cancel()
 		t.Logf("endpoint %q -> egress %q", ep, txt)
+	}
+}
+
+// TestLiveIPv6Egress dials an IPv6 target through the tunnel's netstack:
+// the trace's ip= line then names the WARP IPv6 egress, if the tunnel
+// carries v6 at all.
+func TestLiveIPv6Egress(t *testing.T) {
+	liveGuard(t)
+	id := loadLiveIdentity(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	tun, err := Dial(ctx, id, "")
+	if err != nil {
+		t.Fatalf("tunnel: %v", err)
+	}
+	defer tun.Close()
+	d, err := NewNetstackDialer(tun, id)
+	if err != nil {
+		t.Fatalf("netstack: %v", err)
+	}
+	conn, err := d.Dial(ctx, "tcp6", "[2606:4700:4700::1111]:80")
+	if err != nil {
+		t.Fatalf("v6 dial: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if _, err := conn.Write([]byte("GET /cdn-cgi/trace HTTP/1.1\r\nHost: www.cloudflare.com\r\nConnection: close\r\n\r\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+	buf := make([]byte, 4096)
+	n, err := io.ReadFull(conn, buf)
+	if err != nil && n == 0 {
+		t.Fatalf("read: %v", err)
+	}
+	body := string(buf[:n])
+	line := ""
+	for _, l := range strings.Split(body, "\n") {
+		if strings.HasPrefix(l, "ip=") {
+			line = strings.TrimSpace(l)
+		}
+	}
+	t.Logf("v6 trace: %s", line)
+	if line == "" {
+		t.Errorf("trace carried no ip= line: %q", body[:min(n, 200)])
+	}
+}
+
+// TestLiveEgressAcrossFreshRegistrations registers several throwaway
+// devices and reports each one's tunnel endpoint and egress: if the
+// endpoint (colo) varies across registrations, so does the egress pool.
+// Every device is deleted again before the test ends.
+func TestLiveEgressAcrossFreshRegistrations(t *testing.T) {
+	liveGuard(t)
+	const n = 5
+	client := NewClient()
+	for i := 0; i < n; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		id, err := RegisterAuto(ctx, Options{Name: "warp-proxy-colo-probe"})
+		if err != nil {
+			cancel()
+			t.Logf("registration %d: %v", i+1, err)
+			continue
+		}
+		ep := id.EndpointV4
+		ports := id.EndpointPorts
+		txt, eerr := egressFor(t, ctx, id, "")
+		cancel()
+		if eerr != nil {
+			t.Logf("registration %d: endpoint=%s ports=%v egress error: %v", i+1, ep, ports, eerr)
+		} else {
+			t.Logf("registration %d: endpoint=%s ports=%v egress=%q", i+1, ep, ports, txt)
+		}
+		delCtx, delCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if derr := client.Delete(delCtx, id); derr != nil {
+			t.Logf("registration %d: delete: %v", i+1, derr)
+		}
+		delCancel()
+		time.Sleep(2 * time.Second)
 	}
 }
 
