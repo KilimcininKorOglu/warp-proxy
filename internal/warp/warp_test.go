@@ -232,3 +232,25 @@ func TestPoolKeepsOldTunnelOnFailedRotation(t *testing.T) {
 		t.Error("failed rotation closed the old tunnel")
 	}
 }
+
+func TestHomeEdgeFromActiveIdentity(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir, ModeReconnect, 1)
+	m.register = func(context.Context) (*masque.Identity, error) {
+		id := testIdentity()
+		id.EndpointV4 = "162.159.198.2"
+		id.EndpointPorts = []int{443, 500}
+		return id, nil
+	}
+	m.connect = func(_ context.Context, _ *masque.Identity,
+		_ string) (Tunnel, Dialer, error) {
+		return &countingTunnel{}, &fakeDialer{}, nil
+	}
+	if err := m.EnsureReady(context.Background()); err != nil {
+		t.Fatalf("EnsureReady: %v", err)
+	}
+	host, ports, ok := m.HomeEdge()
+	if !ok || host != "162.159.198.2" || len(ports) != 2 {
+		t.Errorf("HomeEdge = %q, %v, %v", host, ports, ok)
+	}
+}

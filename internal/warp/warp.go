@@ -165,7 +165,7 @@ func (m *Manager) Reconnect(ctx context.Context) error {
 	}
 	if next != m.active {
 		// nils tear the old tunnel down; the identity file stays.
-		m.swap(m.active, nil, nil)
+		m.swap(m.active, nil, nil, nil)
 		m.active = next
 	}
 	m.last = time.Now()
@@ -264,7 +264,7 @@ func (m *Manager) connectLocked(ctx context.Context, i int, endpoint string) err
 	if err != nil {
 		return err
 	}
-	m.swap(i, tun, d)
+	m.swap(i, id, tun, d)
 	return nil
 }
 
@@ -320,11 +320,12 @@ func (m *Manager) registerIdentity(ctx context.Context) (*masque.Identity, error
 }
 
 // swap installs worker i's new tunnel and dialer, dropping the old ones.
-func (m *Manager) swap(i int, tun Tunnel, d Dialer) {
+func (m *Manager) swap(i int, id *masque.Identity, tun Tunnel, d Dialer) {
 	w := m.workers[i]
 	if w.tun != nil {
 		w.tun.Close()
 	}
+	w.id = id
 	w.tun = tun
 	w.d = d
 }
