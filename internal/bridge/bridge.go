@@ -97,6 +97,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// One shared model catalogue for both API flavors, free models only.
+	if r.Method == http.MethodGet && r.URL.Path == "/v1/models" {
+		s.serveModels(w, r)
+		return
+	}
+
 	cfg := s.Cfg()
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
