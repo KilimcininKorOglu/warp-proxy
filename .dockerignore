@@ -1,0 +1,6 @@
+bin/
+.env
+config/config.yaml
+state/
+*.md
+helper-projects/
