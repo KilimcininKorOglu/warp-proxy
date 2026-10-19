@@ -90,6 +90,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The Anthropic-compatible surface runs the same pipeline with its
+	// own request/response translation.
+	if r.Method == http.MethodPost && r.URL.Path == "/v1/messages" {
+		s.serveMessages(w, r)
+		return
+	}
+
 	cfg := s.Cfg()
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
@@ -105,6 +112,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Add the free-tier tool stubs and identity before the request is
 	// (possibly) replayed, so every attempt carries the same body.
 	body, ids := renderInjection(cfg, body)
+
+	// The free tier refuses stream:false: with injection on the upstream
+	// always streams, and a caller that asked for JSON gets the SSE
+	// reassembled into one chat.completion object.
+	clientStream := wantsStream(body)
+	if ids != nil {
+		body = forceStream(body)
+	}
 
 	if err := s.acquire(r.Context(), cfg); err != nil {
 		http.Error(w, "bridge busy: "+err.Error(), http.StatusServiceUnavailable)
@@ -122,6 +137,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+
+	if ids != nil && !clientStream && isSSE(resp) {
+		agg := aggregateSSE(resp.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(agg.openaiCompletion())
+		s.note("info", "%s %s -> 200 (aggregated)", r.Method, r.URL.Path)
+		return
+	}
 	copyResponse(w, resp)
 	s.note("info", "%s %s -> %d", r.Method, r.URL.Path, resp.StatusCode)
 }

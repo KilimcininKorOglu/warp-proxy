@@ -3,6 +3,7 @@ package bridge
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -321,6 +322,102 @@ func TestOversizedBodyRejected(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Errorf("status = %d, want 413", resp.StatusCode)
+	}
+}
+
+// TestJSONCallerGetsAggregatedStream proves gate-4 handling: the client
+// asks for JSON, the bridge forces stream:true upstream, the scripted
+// upstream answers with SSE, and the caller still receives one
+// chat.completion object carrying the full content.
+func TestJSONCallerGetsAggregatedStream(t *testing.T) {
+	bridge := startBridge(t, func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Stream *bool `json:"stream"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.Stream == nil || !*body.Stream {
+			t.Error("upstream did not receive stream:true")
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,"+
+			"\"delta\":{\"content\":\"hi there\"},\"finish_reason\":\"stop\"}]}\n\n")
+		io.WriteString(w, "data: [DONE]\n\n")
+	}, func(context.Context) error { return nil }, true, 0, false)
+
+	resp, err := http.Post(bridge.URL+"/v1/chat/completions", "application/json",
+		bytes.NewBufferString(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d body=%s", resp.StatusCode, out)
+	}
+	var completion struct {
+		Object  string `json:"object"`
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(out, &completion); err != nil {
+		t.Fatalf("body is not a chat.completion: %s", out)
+	}
+	if completion.Object != "chat.completion" || len(completion.Choices) == 0 ||
+		completion.Choices[0].Message.Content != "hi there" {
+		t.Errorf("aggregated completion = %s", out)
+	}
+}
+
+// TestAnthropicMessagesEndToEnd proves /v1/messages: the Anthropic-shaped
+// request is translated, answered from the upstream SSE stream, and
+// returned in the Anthropic envelope.
+func TestAnthropicMessagesEndToEnd(t *testing.T) {
+	var gotPath, gotUA string
+	bridge := startBridge(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotUA = r.Header.Get("User-Agent")
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"id\":\"c9\",\"model\":\"big-pickle\",\"choices\":["+""+
+			"{\"index\":0,\"delta\":{\"content\":\"translated\"},\"finish_reason\":\"stop\"}]}\n\n")
+	}, func(context.Context) error { return nil }, true, 0, false)
+
+	anthropicBody := `{"model":"big-pickle","max_tokens":100,
+		"system":"be brief",
+		"messages":[{"role":"user","content":[{"type":"text","text":"selam"}]}]}`
+	resp, err := http.Post(bridge.URL+"/v1/messages", "application/json",
+		bytes.NewBufferString(anthropicBody))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d body=%s", resp.StatusCode, out)
+	}
+	if gotPath != "/v1/chat/completions" {
+		t.Errorf("upstream path = %q, want the chat completions path", gotPath)
+	}
+	if !strings.HasPrefix(gotUA, "opencode/") {
+		t.Errorf("UA = %q, want an opencode UA", gotUA)
+	}
+	var msg struct {
+		Type    string `json:"type"`
+		Role    string `json:"role"`
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(out, &msg); err != nil {
+		t.Fatalf("body is not an anthropic message: %s", out)
+	}
+	if msg.Type != "message" || msg.Role != "assistant" || len(msg.Content) == 0 ||
+		msg.Content[0].Text != "translated" {
+		t.Errorf("anthropic message = %s", out)
 	}
 }
 

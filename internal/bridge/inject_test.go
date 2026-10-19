@@ -7,28 +7,52 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"strconv"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"warp-proxy/internal/config"
 )
 
 var (
-	sessionIDPattern = regexp.MustCompile(`^ses_\d{26}$`)
+	// The upstream validates ses_ ids against this shape and decodes the
+	// first 12 hex characters back to a timestamp (descending identifier).
+	sessionIDPattern = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
 	requestIDPattern = regexp.MustCompile(`^msg_[0-9A-Za-z]{24}$`)
 )
 
-func TestRandomIDShape(t *testing.T) {
-	if id := sessionPrefix + randomString(digitChars, sessionDigits); !sessionIDPattern.MatchString(id) {
-		t.Errorf("session id %q does not match %s", id, sessionIDPattern)
-	}
+func TestMintedIDsMatchCanonicalShape(t *testing.T) {
 	for range 50 {
-		if id := sessionPrefix + randomString(digitChars, sessionDigits); !sessionIDPattern.MatchString(id) {
-			t.Errorf("session id %q does not match %s", id, sessionIDPattern)
+		session, request := newIDs()
+		if !sessionIDPattern.MatchString(session) {
+			t.Errorf("session id %q does not match %s", session, sessionIDPattern)
 		}
-		if id := requestPrefix + randomString(alnumChars, requestLength); !requestIDPattern.MatchString(id) {
-			t.Errorf("request id %q does not match %s", id, requestIDPattern)
+		if !requestIDPattern.MatchString(request) {
+			t.Errorf("request id %q does not match %s", request, requestIDPattern)
 		}
+	}
+}
+
+func TestMintedSessionDecodesToRecentTimestamp(t *testing.T) {
+	session, _ := newIDs()
+	hexPart := session[len(sessionPrefix) : len(sessionPrefix)+12]
+	if hexPart[9:] != "ffe" {
+		t.Errorf("low three hex digits = %q, want ffe (counter 1)", hexPart[9:])
+	}
+	payload, err := strconv.ParseUint(hexPart, 16, 64)
+	if err != nil {
+		t.Fatalf("hex decode: %v", err)
+	}
+	// Invert the payload and drop the 12-bit counter: what remains is the
+	// low 36 bits of the mint-time unix_ms (the 48-bit layout truncates
+	// the rest, exactly like the reference implementation).
+	inverted := ^payload & 0xFFFFFFFFFFFF
+	gotMs := int64(inverted >> 12)
+	wantMs := time.Now().UnixMilli() & (1<<36 - 1)
+	diff := gotMs - wantMs
+	if diff < -3000 || diff > 3000 {
+		t.Errorf("decoded timestamp %d, want the truncated now %d", gotMs, wantMs)
 	}
 }
 

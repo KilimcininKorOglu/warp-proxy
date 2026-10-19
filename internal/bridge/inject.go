@@ -1,10 +1,14 @@
 package bridge
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"warp-proxy/internal/config"
 )
@@ -22,26 +26,82 @@ const (
 	// replaced with it.
 	opencodeUA = "opencode/1.18.30 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
 
-	// The gateway validates X-Opencode-Session by format only: "ses_"
-	// followed by exactly 26 digits (^ses_\d{26}$). X-Opencode-Request is
-	// "msg_" followed by 24 alphanumeric characters.
+	// The gateway validates X-Opencode-Session beyond its format: the
+	// first 12 hex characters decode to a timestamp that must be recent
+	// (see newIDs). X-Opencode-Request is "msg_" followed by 24
+	// alphanumeric characters.
 	sessionPrefix = "ses_"
-	sessionDigits = 26
 	requestPrefix = "msg_"
 	requestLength = 24
 
-	digitChars = "0123456789"
 	alnumChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+	// npmRegistryURL publishes the current opencode release; the User-Agent
+	// version is discovered from it so a version bump upstream does not
+	// strand the bridge on a stale fingerprint (old versions get 426).
+	npmRegistryURL = "https://registry.npmjs.org/opencode-ai/latest"
+	// userAgentSuffix pins the SDK and runtime parts that follow the
+	// version, which the free tier does not gate on.
+	userAgentSuffix = " ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
 )
+
+// uaOverride carries the discovered User-Agent; empty until discovery
+// succeeds.
+var uaOverride atomic.Value
 
 // identity carries the OpenCode values injected into upstream requests. A nil
 // identity disables injection.
 type identity struct {
 	session string
 	request string
+	ua      string
 	// force makes apply overwrite client-provided ids; set by rotate after
 	// a WARP rotation when Bridge.RotateSessionOnRetry is on.
 	force bool
+}
+
+// SetUserAgent overrides the injected User-Agent (used by the npm registry
+// discovery). Empty resets to the built-in default.
+func SetUserAgent(ua string) {
+	uaOverride.Store(ua)
+}
+
+// currentUserAgent returns the discovered or default User-Agent.
+func currentUserAgent() string {
+	if v, ok := uaOverride.Load().(string); ok && v != "" {
+		return v
+	}
+	return opencodeUA
+}
+
+// DiscoverUserAgent fetches the current opencode release version from the
+// npm registry and installs it as the injected User-Agent. It returns the
+// installed value.
+func DiscoverUserAgent(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, npmRegistryURL, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("npm registry status %d", resp.StatusCode)
+	}
+	var payload struct {
+		Version string `json:"version"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return "", err
+	}
+	if payload.Version == "" {
+		return "", fmt.Errorf("npm registry answered without a version")
+	}
+	ua := "opencode/" + payload.Version + userAgentSuffix
+	SetUserAgent(ua)
+	return ua, nil
 }
 
 // newIdentity builds the identity for one client request when injection is
@@ -51,7 +111,7 @@ func newIdentity(cfg config.BridgeConfig) *identity {
 		return nil
 	}
 	session, request := newIDs()
-	return &identity{session: session, request: request}
+	return &identity{session: session, request: request, ua: currentUserAgent()}
 }
 
 // renderInjection applies the free-tier identity to a request: it returns the
@@ -90,14 +150,21 @@ func (id *identity) apply(h http.Header) {
 		h.Set("X-Opencode-Request", id.request)
 	}
 	if ua := h.Get("User-Agent"); !strings.HasPrefix(strings.ToLower(ua), "opencode/") {
-		h.Set("User-Agent", opencodeUA)
+		h.Set("User-Agent", id.ua)
 	}
 }
 
-// newIDs returns a fresh session id ("ses_" + 26 digits) and request id
-// ("msg_" + 24 alphanumeric characters).
+// newIDs returns a fresh session id and request id. The session follows
+// OpenCode's canonical descending-identifier layout — "ses_" + the hex of
+// the inverted 48-bit ~(unix_ms<<12 | counter) — because the upstream
+// decodes the first 12 hex characters back to a timestamp and refuses
+// values outside a recent window. Counter 1 puts "ffe" in the low three
+// hex digits, matching the genuine client. The request id is "msg_" plus
+// 24 alphanumeric characters.
 func newIDs() (session, request string) {
-	return sessionPrefix + randomString(digitChars, sessionDigits),
+	ms := uint64(time.Now().UnixMilli())
+	payload := ^(ms<<12 | 1) & 0xFFFFFFFFFFFF
+	return sessionPrefix + fmt.Sprintf("%012x", payload) + randomString(alnumChars, 14),
 		requestPrefix + randomString(alnumChars, requestLength)
 }
 

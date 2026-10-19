@@ -93,6 +93,10 @@ func main() {
 		checker.Loop(ctx, healthInterval(cfg))
 	}()
 
+	// Track the current opencode release so the injected free-tier
+	// User-Agent never goes stale (old versions get 426 upstream).
+	go refreshBridgeUserAgent(ctx, logs)
+
 	// In round-robin mode the fresh sessions often land on one shared
 	// egress; run a bounded dedupe pass in the background so the pool
 	// spreads across exit IPs. Every rotation goes through the limiter.
@@ -271,6 +275,31 @@ func startBridge(errCh chan error, cfg *config.Config, checker *health.Checker,
 		os.Exit(1)
 	}
 	go func() { errCh <- http.Serve(ln, srv) }()
+}
+
+// refreshBridgeUserAgent discovers the current opencode release from the
+// npm registry at startup and then every 6 hours, so the free-tier
+// fingerprint follows upstream releases.
+func refreshBridgeUserAgent(ctx context.Context, logs *logbuf.Buffer) {
+	attempt := func() {
+		ua, err := bridge.DiscoverUserAgent(ctx)
+		if err != nil {
+			logs.Add("warn", "bridge", "user-agent discovery failed: %v", err)
+			return
+		}
+		logs.Add("info", "bridge", "user-agent discovered: %s", ua)
+	}
+	attempt()
+	ticker := time.NewTicker(6 * time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			attempt()
+		}
+	}
 }
 
 // runPublicProxyPool refreshes the scraped public proxy pool on its
