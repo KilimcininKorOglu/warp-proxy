@@ -265,9 +265,10 @@ func TestGivesUpAfterAttempts(t *testing.T) {
 		w.WriteHeader(429)
 	}, rotations)
 
-	resp, err := http.Get(bridge.URL + "/v1/models")
+	resp, err := http.Post(bridge.URL+"/v1/chat/completions", "application/json",
+		bytes.NewBufferString(`{"messages":[]}`))
 	if err != nil {
-		t.Fatalf("GET: %v", err)
+		t.Fatalf("POST: %v", err)
 	}
 	resp.Body.Close()
 	if resp.StatusCode != 429 {
@@ -295,9 +296,10 @@ func TestPlain429RetriesWithoutRotation(t *testing.T) {
 		io.WriteString(w, `{"ok":true}`)
 	}, rotations)
 
-	resp, err := http.Get(bridge.URL + "/v1/models")
+	resp, err := http.Post(bridge.URL+"/v1/chat/completions", "application/json",
+		bytes.NewBufferString(`{"messages":[]}`))
 	if err != nil {
-		t.Fatalf("GET: %v", err)
+		t.Fatalf("POST: %v", err)
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
@@ -418,6 +420,48 @@ func TestAnthropicMessagesEndToEnd(t *testing.T) {
 	if msg.Type != "message" || msg.Role != "assistant" || len(msg.Content) == 0 ||
 		msg.Content[0].Text != "translated" {
 		t.Errorf("anthropic message = %s", out)
+	}
+}
+
+// TestModelsListsFreeOnlyWithBothFlavors proves /v1/models keeps the
+// upstream entries verbatim, drops non-free ids and adds the fields
+// Anthropic clients expect.
+func TestModelsListsFreeOnlyWithBothFlavors(t *testing.T) {
+	bridge := startBridge(t, func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, `{"object":"list","data":[
+			{"id":"big-pickle","object":"model","created":1,"owned_by":"opencode"},
+			{"id":"minimax-m3.1-flash-free","object":"model","created":1,"owned_by":"opencode"},
+			{"id":"jev-1.13","object":"model","created":1,"owned_by":"opencode"},
+			{"id":"glm-5.3-flash-free","object":"model","created":1,"owned_by":"opencode"}
+		]}`)
+	}, func(context.Context) error { return nil }, true, 0, false)
+
+	resp, err := http.Get(bridge.URL + "/v1/models")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	var list struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(out, &list); err != nil {
+		t.Fatalf("body: %s", out)
+	}
+	if len(list.Data) != 2 {
+		t.Fatalf("models = %s, want only the two -free entries", out)
+	}
+	for _, entry := range list.Data {
+		id, _ := entry["id"].(string)
+		if !strings.HasSuffix(id, "-free") {
+			t.Errorf("non-free id leaked: %q", id)
+		}
+		if entry["display_name"] != id || entry["type"] != "model" {
+			t.Errorf("anthropic fields missing on %q: %v", id, entry)
+		}
+		if entry["created"] != float64(1) || entry["owned_by"] != "opencode" {
+			t.Errorf("upstream fields altered on %q: %v", id, entry)
+		}
 	}
 }
 
