@@ -512,6 +512,61 @@ func TestEgressCollidersPicksLaterWorkers(t *testing.T) {
 
 func ptr(s string) *string { return &s }
 
+// prefDialer records the IPv6 preference applied to it.
+type prefDialer struct {
+	pref atomic.Pointer[string]
+}
+
+func (p *prefDialer) SetIPv6Pref(pref string) { p.pref.Store(&pref) }
+
+func (p *prefDialer) Dial(context.Context, string, string) (net.Conn, error) {
+	return nil, errors.New("fake dialer")
+}
+
+func (p *prefDialer) Resolve(context.Context, string) (net.IP, error) {
+	return nil, errors.New("fake dialer")
+}
+
+func TestIPv6PreferenceAppliesToLiveDialers(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir, ModeReconnect, 2, DistributionRoundRobin)
+	m.register = func(context.Context) (*masque.Identity, error) {
+		return testIdentity(), nil
+	}
+	dialers := []*prefDialer{{}, {}}
+	next := 0
+	m.connect = func(context.Context, *masque.Identity,
+		string) (Tunnel, Dialer, error) {
+		d := dialers[next]
+		next++
+		return &countingTunnel{}, d, nil
+	}
+	// The preference set before connecting must reach new dialers too.
+	m.SetIPv6Preference("prefer")
+	if err := m.EnsureReady(context.Background()); err != nil {
+		t.Fatalf("EnsureReady: %v", err)
+	}
+	for i, d := range dialers {
+		if got := d.pref.Load(); got == nil || *got != "prefer" {
+			t.Errorf("dialer %d pref = %v, want prefer", i, got)
+		}
+	}
+	// A live change must reach the already-connected dialers.
+	m.SetIPv6Preference("only")
+	for i, d := range dialers {
+		if got := d.pref.Load(); got == nil || *got != "only" {
+			t.Errorf("dialer %d pref after change = %v, want only", i, got)
+		}
+	}
+	if m.IPv6Preference() != "only" {
+		t.Errorf("manager pref = %q, want only", m.IPv6Preference())
+	}
+	m.SetIPv6Preference("bogus")
+	if m.IPv6Preference() != "off" {
+		t.Errorf("bogus pref = %q, want off fallback", m.IPv6Preference())
+	}
+}
+
 func TestHomeEdgeFromActiveIdentity(t *testing.T) {
 	dir := t.TempDir()
 	m := NewManager(dir, ModeReconnect, 1, DistributionOff)

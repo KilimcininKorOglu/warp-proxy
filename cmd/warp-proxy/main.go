@@ -49,6 +49,7 @@ func main() {
 
 	manager := warp.NewManager(cfg.Warp.StateDir, cfg.Warp.ReconnectMode,
 		cfg.Warp.Accounts, cfg.Warp.Distribution)
+	manager.SetIPv6Preference(cfg.Warp.IPv6Preference)
 	upstream := &proxy.Upstream{DialFunc: manager.Dial, Resolve: manager.ResolveIP}
 
 	// Front rewriting: pool fed by the Clean-IP scan, decisions read the
@@ -109,6 +110,7 @@ func main() {
 	panel.Logger = logger
 	panel.OnLiveConfigChange = func(c *config.Config) {
 		manager.SetMode(c.Warp.ReconnectMode)
+		manager.SetIPv6Preference(c.Warp.IPv6Preference)
 		applyLimiter(c, checker)
 	}
 	panel.Scanner = func(ctx context.Context, c *config.Config) ([]cleanip.Result, error) {

@@ -276,6 +276,12 @@ func applyForm(cfg *config.Config, r *http.Request) {
 	if cfg.Warp.Distribution != warp.DistributionRoundRobin {
 		cfg.Warp.Distribution = warp.DistributionOff
 	}
+	cfg.Warp.IPv6Preference = r.FormValue("warp_ipv6_preference")
+	switch cfg.Warp.IPv6Preference {
+	case "prefer", "only":
+	default:
+		cfg.Warp.IPv6Preference = "off"
+	}
 	cfg.Health.Enabled = r.FormValue("health_enabled") == "on"
 	cfg.Health.Interval = formOr(r, "health_interval", cfg.Health.Interval)
 	cfg.Health.Timeout = formOr(r, "health_timeout", cfg.Health.Timeout)

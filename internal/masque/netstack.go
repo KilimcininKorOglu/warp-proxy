@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/buffer"
@@ -34,6 +35,16 @@ const packetQueue = 256
 // ErrNoAnswer marks a resolver timeout.
 var ErrNoAnswer = errors.New("dns: no answer")
 
+// IPv6 preference modes for the resolver (warp.ipv6_preference).
+const (
+	// IPv6Off resolves A records only (today's behavior).
+	IPv6Off = "off"
+	// IPv6Prefer tries AAAA first and falls back to A.
+	IPv6Prefer = "prefer"
+	// IPv6Only accepts AAAA only.
+	IPv6Only = "only"
+)
+
 // NetstackDialer dials TCP through a MASQUE tunnel via a gVisor userspace
 // stack: the tunnel carries IP packets, netstack terminates TCP, and DNS
 // resolves remotely (1.1.1.1 through the tunnel) so hostnames never leak.
@@ -45,6 +56,7 @@ type NetstackDialer struct {
 	ipv6  net.IP
 
 	dnsTimeout time.Duration
+	ipv6Pref   atomic.Value // string: IPv6Off (default), IPv6Prefer, IPv6Only
 }
 
 // NewNetstackDialer builds the userspace stack for the tunnel and starts the
@@ -235,24 +247,60 @@ func waitConnected(ctx context.Context, ep tcpip.Endpoint, wq *waiter.Queue,
 	}
 }
 
-// Resolve answers a hostname's first A record through the tunnel.
+// Resolve answers a hostname's address through the tunnel, honoring the
+// configured IPv6 preference: off queries A only, prefer tries AAAA first
+// and falls back to A, only accepts AAAA.
 func (d *NetstackDialer) Resolve(ctx context.Context, host string) (net.IP, error) {
-	ip := net.ParseIP(host)
-	if ip != nil {
+	if ip := net.ParseIP(host); ip != nil {
 		return ip, nil
 	}
-	resp, err := d.dnsExchange(ctx, BuildAQuery(host))
-	if err != nil {
-		return nil, err
+	pref := d.IPv6Pref()
+	if pref != IPv6Off {
+		if ip := d.queryAddr(ctx, host, BuildAAAAQuery, parseDNSMessageAAAA); ip != nil {
+			return ip, nil
+		}
+		if pref == IPv6Only {
+			return nil, fmt.Errorf("no AAAA record for %s (ipv6_preference=only)", host)
+		}
 	}
-	addrs, err := parseDNSMessageA(resp)
-	if err != nil {
-		return nil, err
-	}
-	if len(addrs) == 0 {
+	ip := d.queryAddr(ctx, host, BuildAQuery, parseDNSMessageA)
+	if ip == nil {
 		return nil, fmt.Errorf("no A record for %s", host)
 	}
-	return addrs[0], nil
+	return ip, nil
+}
+
+// queryAddr sends one DNS query through the tunnel and returns the first
+// matching answer record, or nil on any failure.
+func (d *NetstackDialer) queryAddr(ctx context.Context, host string,
+	build func(string) []byte, parse func([]byte) ([]net.IP, error)) net.IP {
+	resp, err := d.dnsExchange(ctx, build(host))
+	if err != nil {
+		return nil
+	}
+	addrs, err := parse(resp)
+	if err != nil || len(addrs) == 0 {
+		return nil
+	}
+	return addrs[0]
+}
+
+// SetIPv6Pref switches the resolver's IPv6 preference at runtime; anything
+// other than IPv6Prefer or IPv6Only falls back to IPv6Off.
+func (d *NetstackDialer) SetIPv6Pref(pref string) {
+	if pref != IPv6Prefer && pref != IPv6Only {
+		pref = IPv6Off
+	}
+	d.ipv6Pref.Store(pref)
+}
+
+// IPv6Pref reports the current preference.
+func (d *NetstackDialer) IPv6Pref() string {
+	p, _ := d.ipv6Pref.Load().(string)
+	if p == "" {
+		return IPv6Off
+	}
+	return p
 }
 
 // dnsExchange sends one DNS query over UDP through the tunnel.

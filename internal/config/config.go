@@ -113,6 +113,10 @@ type WarpConfig struct {
 	// "round-robin" (every account keeps a live tunnel and requests
 	// spread across them per request). Needs a restart to change.
 	Distribution string `yaml:"distribution"`
+	// IPv6Preference is "off" (resolve A only), "prefer" (AAAA first,
+	// fallback A) or "only" (AAAA only) for hostname resolution inside
+	// the tunnel. Applies live.
+	IPv6Preference string `yaml:"ipv6_preference"`
 }
 
 // HealthConfig configures the periodic health check through the WARP proxy.
@@ -149,10 +153,11 @@ func Defaults() *Config {
 		HTTPProxy: ListenerConfig{Listen: ":8591"},
 		SOCKS:     ListenerConfig{Listen: ":8592"},
 		Warp: WarpConfig{
-			StateDir:      "state",
-			Accounts:      1,
-			ReconnectMode: "reconnect",
-			Distribution:  "off",
+			StateDir:       "state",
+			Accounts:       1,
+			ReconnectMode:  "reconnect",
+			Distribution:   "off",
+			IPv6Preference: "off",
 		},
 		Health: HealthConfig{
 			Enabled:  true,

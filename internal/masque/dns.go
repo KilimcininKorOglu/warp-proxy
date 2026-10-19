@@ -41,6 +41,11 @@ func BuildAQuery(name string) []byte {
 	return buildDNSQuery(name, 1, 1)
 }
 
+// BuildAAAAQuery encodes one recursive AAAA (IPv6) query for name.
+func BuildAAAAQuery(name string) []byte {
+	return buildDNSQuery(name, 28, 1)
+}
+
 // BuildTXTQuery encodes one recursive TXT query for name (CHAOS class, the
 // class whoami.cloudflare answers in).
 func BuildTXTQuery(name string) []byte {
@@ -53,23 +58,39 @@ var errNotOurDNS = errors.New("not a response to our query")
 // parseDNSMessageA returns the A records of a bare DNS message (as delivered
 // by a netstack UDP endpoint, which terminates IP and UDP).
 func parseDNSMessageA(d []byte) ([]net.IP, error) {
+	return parseDNSMessageRecords(d, 1, 4)
+}
+
+// parseDNSMessageAAAA returns the AAAA records of a bare DNS message.
+func parseDNSMessageAAAA(d []byte) ([]net.IP, error) {
+	return parseDNSMessageRecords(d, 28, 16)
+}
+
+// parseDNSMessageRecords validates the bare DNS message header and returns
+// the answer records of rtype with size-byte RDATA.
+func parseDNSMessageRecords(d []byte, rtype, size int) ([]net.IP, error) {
 	if len(d) < 12 || d[0] != byte(dnsID>>8&0xff) || d[1] != byte(dnsID&0xff) {
 		return nil, errNotOurDNS
 	}
 	if d[2]&0x80 == 0 {
 		return nil, errNotOurDNS // not a response
 	}
-	return parseAFromMessage(d)
+	return parseRecords(d, rtype, size)
 }
 
 // parseAFromMessage walks the answer section of a validated DNS message.
 func parseAFromMessage(d []byte) ([]net.IP, error) {
+	return parseRecords(d, 1, 4)
+}
+
+// parseRecords collects answer records of rtype with rdlen-byte addresses.
+func parseRecords(d []byte, rtype, size int) ([]net.IP, error) {
 	if rcode := d[3] & 0x0f; rcode != 0 {
 		return nil, fmt.Errorf("dns rcode %d", rcode)
 	}
 	var out []net.IP
-	eachAnswer(d, func(rtype uint16, data []byte) {
-		if rtype == 1 && len(data) == 4 {
+	eachAnswer(d, func(rt uint16, data []byte) {
+		if int(rt) == rtype && len(data) == size {
 			out = append(out, net.IP(data))
 		}
 	})

@@ -88,6 +88,7 @@ type Manager struct {
 	endpoint     string // pin override applied at the next (re)connect
 	last         time.Time
 	distribution string // DistributionOff or DistributionRoundRobin
+	ipv6Pref     string // masque resolver IPv6 preference
 	rrCounter    atomic.Uint64
 	egress       map[int]string // worker index -> last measured egress IP
 
@@ -417,8 +418,21 @@ func (m *Manager) connectLocked(ctx context.Context, i int, endpoint string) err
 	if err != nil {
 		return err
 	}
+	if s, ok := d.(interface{ SetIPv6Pref(string) }); ok {
+		// The caller holds m.mu, so read the field directly.
+		s.SetIPv6Pref(m.ipv6PrefValue())
+	}
 	m.swap(i, id, tun, d)
 	return nil
+}
+
+// ipv6PrefValue reads the preference without locking; the caller must
+// already hold m.mu.
+func (m *Manager) ipv6PrefValue() string {
+	if m.ipv6Pref == "" {
+		return masque.IPv6Off
+	}
+	return m.ipv6Pref
 }
 
 // reregisterLocked deletes worker i's registration and starts over with a
@@ -499,6 +513,36 @@ func (m *Manager) connectTunnel(ctx context.Context, id *masque.Identity,
 		return nil, nil, err
 	}
 	return tun, nd, nil
+}
+
+// SetIPv6Preference switches the resolver's IPv6 preference at runtime
+// (masque.IPv6Off / IPv6Prefer / IPv6Only) and applies it to every live
+// tunnel's dialer.
+func (m *Manager) SetIPv6Preference(pref string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if pref != masque.IPv6Prefer && pref != masque.IPv6Only {
+		pref = masque.IPv6Off
+	}
+	m.ipv6Pref = pref
+	for _, w := range m.workers {
+		if w == nil || w.d == nil {
+			continue
+		}
+		if s, ok := w.d.(interface{ SetIPv6Pref(string) }); ok {
+			s.SetIPv6Pref(pref)
+		}
+	}
+}
+
+// IPv6Preference reports the resolver's IPv6 preference.
+func (m *Manager) IPv6Preference() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.ipv6Pref == "" {
+		return masque.IPv6Off
+	}
+	return m.ipv6Pref
 }
 
 // egressTraceURL is fetched through each tunnel to read its exit IP.

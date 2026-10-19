@@ -108,6 +108,62 @@ func TestBuildAQueryShape(t *testing.T) {
 	}
 }
 
+func TestParseDNSAnswerAAAA(t *testing.T) {
+	var d bytes.Buffer
+	d.Write([]byte{byte(dnsID >> 8), byte(dnsID & 0xff), 0x81, 0, 0, 1, 0, 1, 0, 0, 0, 0})
+	for _, label := range splitName("example.com") {
+		d.WriteByte(byte(len(label)))
+		d.WriteString(label)
+	}
+	d.WriteByte(0)
+	binary.Write(&d, binary.BigEndian, uint16(28)) // qtype AAAA
+	binary.Write(&d, binary.BigEndian, uint16(1))  // IN
+	binary.Write(&d, binary.BigEndian, uint16(0xc00c))
+	binary.Write(&d, binary.BigEndian, uint16(28)) // AAAA
+	binary.Write(&d, binary.BigEndian, uint16(1))  // IN
+	binary.Write(&d, binary.BigEndian, uint32(60))
+	binary.Write(&d, binary.BigEndian, uint16(16))
+	ipv6 := net.ParseIP("2606:4700:4700::1111").To16()
+	d.Write(ipv6)
+
+	addrs, err := parseDNSMessageAAAA(d.Bytes())
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(addrs) != 1 || !addrs[0].Equal(net.ParseIP("2606:4700:4700::1111")) {
+		t.Errorf("addrs = %v", addrs)
+	}
+}
+
+func TestBuildAAAAQueryShape(t *testing.T) {
+	q := BuildAAAAQuery("a.b")
+	if q[len(q)-4] != 0 || q[len(q)-3] != 28 {
+		t.Error("qtype is not AAAA")
+	}
+	if q[len(q)-2] != 0 || q[len(q)-1] != 1 {
+		t.Error("qclass is not IN")
+	}
+}
+
+func TestIPv6PrefNormalization(t *testing.T) {
+	d := &NetstackDialer{}
+	if d.IPv6Pref() != IPv6Off {
+		t.Errorf("default pref = %q, want off", d.IPv6Pref())
+	}
+	d.SetIPv6Pref("prefer")
+	if d.IPv6Pref() != IPv6Prefer {
+		t.Errorf("pref = %q, want prefer", d.IPv6Pref())
+	}
+	d.SetIPv6Pref("only")
+	if d.IPv6Pref() != IPv6Only {
+		t.Errorf("pref = %q, want only", d.IPv6Pref())
+	}
+	d.SetIPv6Pref("bogus")
+	if d.IPv6Pref() != IPv6Off {
+		t.Errorf("bogus pref = %q, want off fallback", d.IPv6Pref())
+	}
+}
+
 func TestParseAssignedIP(t *testing.T) {
 	if got := parseAssignedIP("100.96.0.3/32"); !got.Equal(net.IPv4(100, 96, 0, 3)) {
 		t.Errorf("parseAssignedIP = %v", got)

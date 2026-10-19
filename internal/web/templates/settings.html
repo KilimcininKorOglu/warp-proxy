@@ -21,6 +21,13 @@
         <option value="round-robin" {{if eq .Cfg.Warp.Distribution "round-robin"}}selected{{end}}>round-robin (her hesap açık, istekler sırayla dağılır)</option>
       </select>
       <div class="muted">round-robin'de her hesabın tüneli açık tutulur ve her istek sıradaki tünele gider. Yeniden başlatma gerekir.</div></td></tr>
+    <tr><th>IPv6 çıkışı</th>
+      <td><select name="warp_ipv6_preference">
+        <option value="off" {{if eq .Cfg.Warp.IPv6Preference "off"}}selected{{end}}>off (yalnız IPv4)</option>
+        <option value="prefer" {{if eq .Cfg.Warp.IPv6Preference "prefer"}}selected{{end}}>prefer (AAAA varsa IPv6, yoksa IPv4)</option>
+        <option value="only" {{if eq .Cfg.Warp.IPv6Preference "only"}}selected{{end}}>only (yalnız IPv6)</option>
+      </select>
+      <div class="muted">Hostname'li hedeflerde çıkış adres ailesi. prefer, AAAA kaydı olan hedefleri ayrı WARP IPv6 egress uzayından çıkarır. Hemen uygulanır.</div></td></tr>
     <tr><th>Health-check</th>
       <td><label><input type="checkbox" name="health_enabled" {{if .Cfg.Health.Enabled}}checked{{end}} style="width:auto"> açık</label></td></tr>
     <tr><th>Kontrol aralığı</th><td><input type="text" name="health_interval" value="{{.Cfg.Health.Interval}}"></td></tr>
