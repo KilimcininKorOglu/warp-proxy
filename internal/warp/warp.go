@@ -7,10 +7,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"maps"
 	"net"
+	"net/http"
 	"os"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -84,6 +89,18 @@ type Manager struct {
 	last         time.Time
 	distribution string // DistributionOff or DistributionRoundRobin
 	rrCounter    atomic.Uint64
+	egress       map[int]string // worker index -> last measured egress IP
+
+	// measure is the egress measurement hook (test override); nil means
+	// the real HTTP-over-tunnel measurement.
+	measure func(ctx context.Context, i int) string
+}
+
+// RotationGate routes each dedupe rotation through the caller's rate
+// limiter, so the manager itself stays limiter-free.
+type RotationGate struct {
+	Allow  func() bool
+	Record func(succeeded bool)
 }
 
 // NewManager builds a Manager persisting identity state under stateDir and
@@ -482,6 +499,157 @@ func (m *Manager) connectTunnel(ctx context.Context, id *masque.Identity,
 		return nil, nil, err
 	}
 	return tun, nd, nil
+}
+
+// egressTraceURL is fetched through each tunnel to read its exit IP.
+const egressTraceURL = "http://www.cloudflare.com/cdn-cgi/trace"
+
+// ReconnectWorker refreshes worker i's tunnel session, dropping the old
+// tunnel only after the new one is up. The caller owns rate limiting.
+func (m *Manager) ReconnectWorker(ctx context.Context, i int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if i < 0 || i >= len(m.workers) {
+		return fmt.Errorf("worker %d out of range", i)
+	}
+	return m.connectLocked(ctx, i, m.endpoint)
+}
+
+// Egresses measures every live worker's exit IP through its own tunnel,
+// caches the result for the dashboard and returns a copy. Failed
+// measurements leave the worker out of the map.
+func (m *Manager) Egresses(ctx context.Context) map[int]string {
+	ips := map[int]string{}
+	for i := range m.workers {
+		if ip := m.measureEgress(ctx, i); ip != "" {
+			ips[i] = ip
+		}
+	}
+	m.mu.Lock()
+	m.egress = ips
+	m.mu.Unlock()
+	out := make(map[int]string, len(ips))
+	for i, ip := range ips {
+		out[i] = ip
+	}
+	return out
+}
+
+// CachedEgresses returns the last measured per-worker egress IPs.
+func (m *Manager) CachedEgresses() map[int]string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make(map[int]string, len(m.egress))
+	for i, ip := range m.egress {
+		out[i] = ip
+	}
+	return out
+}
+
+// measureEgress reads the exit IP through worker i's tunnel; empty on any
+// failure. The real implementation runs HTTP over the worker's dialer.
+func (m *Manager) measureEgress(ctx context.Context, i int) string {
+	if m.measure != nil {
+		return m.measure(ctx, i)
+	}
+	m.mu.RLock()
+	var d Dialer
+	if i < len(m.workers) && m.workers[i] != nil {
+		d = m.workers[i].d
+	}
+	m.mu.RUnlock()
+	if d == nil {
+		return ""
+	}
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return d.Dial(ctx, network, addr)
+		},
+	}
+	client := &http.Client{Transport: tr, Timeout: 20 * time.Second}
+	resp, err := client.Get(egressTraceURL)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	for _, line := range strings.Split(string(body), "\n") {
+		if ip, ok := strings.CutPrefix(line, "ip="); ok {
+			return strings.TrimSpace(ip)
+		}
+	}
+	return ""
+}
+
+// DedupeEgress evens out the round-robin pool's exit IPs: it measures
+// every live tunnel, refreshes the colliding workers' sessions (all but
+// the first worker on each shared IP) and re-measures, at most passes
+// times. Each rotation goes through the gate, so a rate-limited pass
+// stops early and keeps sharing. It is a no-op error outside round-robin
+// mode. It returns the number of rotated tunnels.
+func (m *Manager) DedupeEgress(ctx context.Context, passes int, gate *RotationGate) (int, error) {
+	m.mu.RLock()
+	mode := m.distribution
+	m.mu.RUnlock()
+	if mode != DistributionRoundRobin {
+		return 0, fmt.Errorf("egress dedupe requires distribution=%s", DistributionRoundRobin)
+	}
+	rotated := 0
+	for p := 0; p < passes; p++ {
+		colliders := egressColliders(m.Egresses(ctx))
+		if len(colliders) == 0 {
+			break
+		}
+		n, progress, stopped := m.rotateColliders(ctx, colliders, gate)
+		rotated += n
+		if stopped || !progress {
+			break
+		}
+	}
+	m.Egresses(ctx)
+	return rotated, nil
+}
+
+// rotateColliders refreshes the colliding workers' sessions one by one. It
+// reports whether any rotation succeeded (progress) and whether the gate
+// cut the pass short (stopped).
+func (m *Manager) rotateColliders(ctx context.Context, colliders []int,
+	gate *RotationGate) (rotated int, progress, stopped bool) {
+	for _, i := range colliders {
+		if gate != nil && gate.Allow != nil && !gate.Allow() {
+			return rotated, progress, true
+		}
+		err := m.ReconnectWorker(ctx, i)
+		if gate != nil && gate.Record != nil {
+			gate.Record(err == nil)
+		}
+		if err != nil {
+			h2Debug("dedupe: worker %d refresh failed: %v", i, err)
+			continue
+		}
+		rotated++
+		progress = true
+	}
+	return rotated, progress, false
+}
+
+// egressColliders lists the workers that share an exit IP with an earlier
+// worker, ascending.
+func egressColliders(ips map[int]string) []int {
+	seen := map[string]bool{}
+	var out []int
+	for _, i := range slices.Sorted(maps.Keys(ips)) {
+		ip := ips[i]
+		if seen[ip] {
+			out = append(out, i)
+			continue
+		}
+		seen[ip] = true
+	}
+	return out
 }
 
 // HomeEdge returns the active identity's registration edge host and its

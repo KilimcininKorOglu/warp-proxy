@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"html/template"
 	"log/slog"
+	"maps"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -70,6 +72,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /logout", s.requireAuth(s.doLogout))
 	mux.HandleFunc("GET /{$}", s.requireAuth(s.showDashboard))
 	mux.HandleFunc("POST /reconnect", s.requireAuth(s.doReconnect))
+	mux.HandleFunc("POST /egress/dedupe", s.requireAuth(s.doEgressDedupe))
 	mux.HandleFunc("GET /settings", s.requireAuth(s.showSettings))
 	mux.HandleFunc("POST /settings", s.requireAuth(s.doSettings))
 	mux.HandleFunc("GET /logs", s.requireAuth(s.showLogs))
@@ -180,12 +183,27 @@ func (s *Server) showDashboard(w http.ResponseWriter, r *http.Request) {
 	cfg := s.GetConfig()
 	st := s.Checker.Status()
 	warpStatus, warpErr := s.Manager.Status(r.Context())
+	rr := cfg.Warp.Distribution == warp.DistributionRoundRobin
+
+	var egresses []string
+	if rr {
+		cached := s.Manager.CachedEgresses()
+		for _, i := range slices.Sorted(maps.Keys(cached)) {
+			ip := cached[i]
+			if ip == "" {
+				ip = "ölçülemedi"
+			}
+			egresses = append(egresses, fmt.Sprintf("hesap %d: %s", i+1, ip))
+		}
+	}
 
 	s.render(w, "dashboard.html", map[string]any{
 		"Health":     st,
 		"WarpStatus": strings.TrimSpace(warpStatus),
 		"WarpError":  warpErr != nil,
 		"Mode":       cfg.Warp.ReconnectMode,
+		"RoundRobin": rr,
+		"Egresses":   egresses,
 		"Limiter":    st.Limiter,
 		"Now":        time.Now(),
 	})
@@ -194,6 +212,22 @@ func (s *Server) showDashboard(w http.ResponseWriter, r *http.Request) {
 func (s *Server) doReconnect(w http.ResponseWriter, r *http.Request) {
 	if err := s.Checker.ManualReconnect(r.Context()); err != nil {
 		s.Logs.Add("warn", "reconnect", "manual reconnect denied or failed: %v", err)
+	}
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+// doEgressDedupe evens out the round-robin pool's exit IPs. Every rotation
+// inside the pass goes through the shared rate limiter.
+func (s *Server) doEgressDedupe(w http.ResponseWriter, r *http.Request) {
+	gate := &warp.RotationGate{
+		Allow:  func() bool { return s.Checker.AllowReconnect().Allowed },
+		Record: s.Checker.RecordReconnect,
+	}
+	n, err := s.Manager.DedupeEgress(r.Context(), 2, gate)
+	if err != nil {
+		s.Logs.Add("warn", "warp", "egress dedupe failed: %v", err)
+	} else {
+		s.Logs.Add("info", "warp", "egress dedupe rotated %d tunnels", n)
 	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }

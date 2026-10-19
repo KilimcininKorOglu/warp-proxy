@@ -91,6 +91,11 @@ func main() {
 		checker.Loop(ctx, healthInterval(cfg))
 	}()
 
+	// In round-robin mode the fresh sessions often land on one shared
+	// egress; run a bounded dedupe pass in the background so the pool
+	// spreads across exit IPs. Every rotation goes through the limiter.
+	go runStartupDedupe(ctx, manager, checker, logs)
+
 	httpSrv := &proxy.HTTPServer{Upstream: upstream, Log: logger, OnRequest: logSink.request}
 	socksSrv := &proxy.SOCKSServer{Upstream: upstream}
 
@@ -241,6 +246,26 @@ func healthInterval(cfg *config.Config) time.Duration {
 		return 5 * time.Minute
 	}
 	return d
+}
+
+// runStartupDedupe evens out the round-robin pool's exit IPs once after
+// startup, rotating through the shared rate limiter. It is a no-op in the
+// other distribution modes.
+func runStartupDedupe(ctx context.Context, manager *warp.Manager,
+	checker *health.Checker, logs *logbuf.Buffer) {
+	if manager.Distribution() != warp.DistributionRoundRobin {
+		return
+	}
+	gate := &warp.RotationGate{
+		Allow:  func() bool { return checker.AllowReconnect().Allowed },
+		Record: checker.RecordReconnect,
+	}
+	n, err := manager.DedupeEgress(ctx, 2, gate)
+	if err != nil {
+		logs.Add("warn", "warp", "startup egress dedupe failed: %v", err)
+	} else if n > 0 {
+		logs.Add("info", "warp", "startup egress dedupe rotated %d tunnels", n)
+	}
 }
 
 // logSink adapts proxy requests into the panel ring buffer.

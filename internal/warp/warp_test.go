@@ -5,8 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -347,6 +350,167 @@ func TestDistributionFallback(t *testing.T) {
 		t.Errorf("distribution = %q, want off fallback", m.Distribution())
 	}
 }
+
+// egressDialer dials a fixed listener (an httptest server), so the real
+// measureEgress implementation runs end to end over a fake tunnel.
+type egressDialer struct{ addr string }
+
+func (d egressDialer) Dial(_ context.Context, _, _ string) (net.Conn, error) {
+	return net.Dial("tcp", d.addr)
+}
+
+func (d egressDialer) Resolve(context.Context, string) (net.IP, error) {
+	return nil, errors.New("fake dialer")
+}
+
+// traceServer serves a cdn-cgi/trace-style body whose ip= line is read
+// from the atomic pointer, so tests can change the exit IP over time.
+func traceServer(t *testing.T, ip *atomic.Pointer[string]) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintf(w, "fl=x\nip=%s\nwarp=on\n", *ip.Load())
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestMeasureEgressParsesTraceIP(t *testing.T) {
+	ip := atomic.Pointer[string]{}
+	ip.Store(ptr("203.0.113.9"))
+	srv := traceServer(t, &ip)
+	m := NewManager(t.TempDir(), ModeReconnect, 1, DistributionOff)
+	m.register = func(context.Context) (*masque.Identity, error) {
+		return testIdentity(), nil
+	}
+	m.connect = func(_ context.Context, _ *masque.Identity,
+		_ string) (Tunnel, Dialer, error) {
+		return &countingTunnel{}, egressDialer{addr: srv.Listener.Addr().String()}, nil
+	}
+	if err := m.EnsureReady(context.Background()); err != nil {
+		t.Fatalf("EnsureReady: %v", err)
+	}
+	if got := m.measureEgress(context.Background(), 0); got != "203.0.113.9" {
+		t.Errorf("measureEgress = %q, want 203.0.113.9", got)
+	}
+	// A dead worker measures empty and stays out of the map.
+	if got := m.measureEgress(context.Background(), 5); got != "" {
+		t.Errorf("measureEgress(dead) = %q, want empty", got)
+	}
+}
+
+func TestDedupeRotatesCollidingWorker(t *testing.T) {
+	dir := t.TempDir()
+	var rotated atomic.Int32
+	m := NewManager(dir, ModeReconnect, 2, DistributionRoundRobin)
+	m.register = func(context.Context) (*masque.Identity, error) {
+		return testIdentity(), nil
+	}
+	m.connect = func(context.Context, *masque.Identity,
+		string) (Tunnel, Dialer, error) {
+		return &countingTunnel{}, &fakeDialer{}, nil
+	}
+	if err := m.EnsureReady(context.Background()); err != nil {
+		t.Fatalf("EnsureReady: %v", err)
+	}
+	// Both workers sit on the same egress; the first rotation of worker 1
+	// moves it off.
+	ips := atomic.Pointer[string]{}
+	ips.Store(ptr("104.28.192.58"))
+	m.measure = func(_ context.Context, i int) string {
+		if i == 1 && rotated.Load() > 0 {
+			return "104.28.224.60"
+		}
+		return "104.28.192.58"
+	}
+	n, err := m.DedupeEgress(context.Background(), 2, &RotationGate{
+		Allow:  func() bool { return true },
+		Record: func(bool) { rotated.Add(1) },
+	})
+	if err != nil {
+		t.Fatalf("DedupeEgress: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("rotated = %d, want 1", n)
+	}
+	if got := m.CachedEgresses(); got[0] != "104.28.192.58" || got[1] != "104.28.224.60" {
+		t.Errorf("cached egresses = %v, want distinct", got)
+	}
+}
+
+func TestDedupeAcceptsUnresolvableCollision(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir, ModeReconnect, 2, DistributionRoundRobin)
+	m.register = func(context.Context) (*masque.Identity, error) {
+		return testIdentity(), nil
+	}
+	m.connect = func(context.Context, *masque.Identity,
+		string) (Tunnel, Dialer, error) {
+		return &countingTunnel{}, &fakeDialer{}, nil
+	}
+	if err := m.EnsureReady(context.Background()); err != nil {
+		t.Fatalf("EnsureReady: %v", err)
+	}
+	// Cloudflare keeps answering the same IP: the pass must stop at the
+	// bound (one rotation per pass) and keep both tunnels alive.
+	m.measure = func(context.Context, int) string { return "104.28.192.58" }
+	var records atomic.Int32
+	n, err := m.DedupeEgress(context.Background(), 2, &RotationGate{
+		Allow:  func() bool { return true },
+		Record: func(bool) { records.Add(1) },
+	})
+	if err != nil {
+		t.Fatalf("DedupeEgress: %v", err)
+	}
+	if n != 2 || records.Load() != 2 {
+		t.Errorf("rotated = %d, records = %d; want 2/2 (pass bound)", n, records.Load())
+	}
+	if ok, _ := m.Connected(context.Background()); !ok {
+		t.Error("dedupe tore down the pool")
+	}
+}
+
+func TestDedupeStopsAtRateLimit(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir, ModeReconnect, 3, DistributionRoundRobin)
+	m.register = func(context.Context) (*masque.Identity, error) {
+		return testIdentity(), nil
+	}
+	m.connect = func(context.Context, *masque.Identity,
+		string) (Tunnel, Dialer, error) {
+		return &countingTunnel{}, &fakeDialer{}, nil
+	}
+	if err := m.EnsureReady(context.Background()); err != nil {
+		t.Fatalf("EnsureReady: %v", err)
+	}
+	m.measure = func(context.Context, int) string { return "104.28.192.58" }
+	n, err := m.DedupeEgress(context.Background(), 2, &RotationGate{
+		Allow:  func() bool { return false },
+		Record: func(bool) {},
+	})
+	if err != nil {
+		t.Fatalf("DedupeEgress: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("rotated = %d, want 0 (limiter denied every rotation)", n)
+	}
+}
+
+func TestDedupeOutsideRoundRobinFails(t *testing.T) {
+	m := NewManager(t.TempDir(), ModeReconnect, 1, DistributionOff)
+	if _, err := m.DedupeEgress(context.Background(), 2, nil); err == nil {
+		t.Error("dedupe ran outside round-robin mode")
+	}
+}
+
+func TestEgressCollidersPicksLaterWorkers(t *testing.T) {
+	got := egressColliders(map[int]string{0: "a", 1: "a", 2: "b", 3: "a"})
+	want := []int{1, 3}
+	if !slices.Equal(got, want) {
+		t.Errorf("colliders = %v, want %v", got, want)
+	}
+}
+
+func ptr(s string) *string { return &s }
 
 func TestHomeEdgeFromActiveIdentity(t *testing.T) {
 	dir := t.TempDir()

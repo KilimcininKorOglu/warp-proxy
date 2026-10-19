@@ -15,11 +15,20 @@
     <tr><th>Son kontrol</th><td>{{if .Health.LastRun.IsZero}}<span class="muted">yok</span>{{else}}{{.Health.LastRun.Format "02.01.2006 15:04:05"}}{{end}}
       {{if .Health.LastError}}<div class="muted">{{.Health.LastError}}</div>{{end}}</td></tr>
     <tr><th>Son flag</th><td>{{if .Health.LastFlagAt.IsZero}}<span class="muted">yok</span>{{else}}{{.Health.LastFlagAt.Format "02.01.2006 15:04:05"}}{{end}}</td></tr>
+    {{if .RoundRobin}}
+    <tr><th>Hesap çıkış IP'leri</th>
+      <td>{{if .Egresses}}{{range .Egresses}}<span class="log">{{.}}</span><br>{{end}}{{else}}<span class="muted">henüz ölçülmedi</span>{{end}}</td></tr>
+    {{end}}
   </table>
   <p>
     <form class="inline" method="post" action="/reconnect">
       <button type="submit">Reconnect (yeni IP)</button>
     </form>
+    {{if .RoundRobin}}
+    <form class="inline" method="post" action="/egress/dedupe">
+      <button type="submit">Egress denkleştir</button>
+    </form>
+    {{end}}
     <span class="muted">Rate-limit'lidir; reddedilirse log sayfasında gerekçe yazar.</span>
   </p>
 </div>
