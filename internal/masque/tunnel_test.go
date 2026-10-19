@@ -2,6 +2,7 @@ package masque
 
 import (
 	"crypto/ecdsa"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"testing"
@@ -44,12 +45,16 @@ func TestPinVerifierAcceptsAndRejects(t *testing.T) {
 	if err != nil {
 		t.Fatalf("self-sign: %v", err)
 	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
 	other, err := GenerateKeypair()
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
 	verify := pinVerifier(&kp.Key().PublicKey)
-	if err := verify(cert.Certificate, nil); err != nil {
+	if err := verify(tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}}); err != nil {
 		t.Errorf("pinned certificate rejected: %v", err)
 	}
 	// A certificate for a different key must fail the pin.
@@ -57,10 +62,14 @@ func TestPinVerifierAcceptsAndRejects(t *testing.T) {
 	if err != nil {
 		t.Fatalf("self-sign: %v", err)
 	}
-	if err := verify(otherCert.Certificate, nil); err == nil {
+	otherLeaf, err := x509.ParseCertificate(otherCert.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if err := verify(tls.ConnectionState{PeerCertificates: []*x509.Certificate{otherLeaf}}); err == nil {
 		t.Error("verifier accepted a certificate with a different key")
 	}
-	if err := verify(nil, nil); err == nil {
+	if err := verify(tls.ConnectionState{}); err == nil {
 		t.Error("verifier accepted an empty chain")
 	}
 }

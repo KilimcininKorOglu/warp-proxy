@@ -256,7 +256,8 @@ func Defaults() *Config {
 
 // Load reads the configuration from path. A missing file yields Defaults.
 func Load(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
+	// The path comes from the -config flag, not from request input.
+	data, err := os.ReadFile(path) // #nosec G304
 	if errors.Is(err, os.ErrNotExist) {
 		return Defaults(), nil
 	}
@@ -283,13 +284,13 @@ func Save(path string, cfg *Config) error {
 		return fmt.Errorf("create temp file: %w", err)
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op after a successful rename
+	defer os.Remove(tmpName) //nolint:errcheck // no-op after a successful rename
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("write temp file: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("fsync temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {

@@ -62,7 +62,10 @@ const sampleSSE = "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":
 	"data: [DONE]\n\n"
 
 func TestAggregateSSE(t *testing.T) {
-	agg := aggregateSSE(strings.NewReader(sampleSSE))
+	agg, err := aggregateSSE(strings.NewReader(sampleSSE))
+	if err != nil {
+		t.Fatalf("aggregateSSE: %v", err)
+	}
 	if agg.ID != "c1" || agg.Model != "m" {
 		t.Errorf("id/model = %q/%q", agg.ID, agg.Model)
 	}

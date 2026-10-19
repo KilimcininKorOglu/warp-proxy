@@ -201,7 +201,7 @@ func (d *NetstackDialer) dialTCP(ctx context.Context, ip net.IP, port int) (net.
 	if err != nil {
 		return nil, fmt.Errorf("endpoint: %v", err)
 	}
-	if err := waitConnected(ctx, ep, &wq, tcpip.FullAddress{NIC: nicID, Addr: remote, Port: uint16(port)}); err != nil {
+	if err := waitConnected(ctx, ep, &wq, tcpip.FullAddress{NIC: nicID, Addr: remote, Port: uint16(port)}); err != nil { // #nosec G115 -- the proxy frontends validate the port range
 		ep.Close()
 		return nil, err
 	}
@@ -357,7 +357,7 @@ func isWouldBlock(err tcpip.Error) bool {
 // parseAssignedIP strips the CIDR suffix and parses the address.
 func parseAssignedIP(cidr string) net.IP {
 	if i := len(cidr); i > 0 {
-		for j := 0; j < i; j++ {
+		for j := range i {
 			if cidr[j] == '/' {
 				cidr = cidr[:j]
 				break

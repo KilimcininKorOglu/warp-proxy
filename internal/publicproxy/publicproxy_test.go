@@ -111,7 +111,7 @@ func TestPoolRoundRobin(t *testing.T) {
 	}
 	p.Set([]Entry{{Addr: "a:1"}, {Addr: "b:2"}, {Addr: "c:3"}})
 	seen := map[string]bool{}
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		e, ok := p.Pick()
 		if !ok {
 			t.Fatal("pick failed")

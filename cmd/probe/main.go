@@ -47,7 +47,7 @@ func run(ctx context.Context, stateDir, endpoint string, force bool) error {
 	if err != nil {
 		return fmt.Errorf("tunnel: %w", err)
 	}
-	defer tunnel.Close()
+	defer tunnel.Close() //nolint:errcheck // probe teardown, error already printed on dial
 	fmt.Printf("tunnel: MASQUE CONNECT -> %d OK\n", tunnel.Status())
 
 	src := assignedV4(id.IPv4)
@@ -61,8 +61,8 @@ func run(ctx context.Context, stateDir, endpoint string, force bool) error {
 	fmt.Printf("whoami.cloudflare TXT: %s\n", answer)
 	// The TXT carries either "ip=<addr>" or the bare address.
 	egress := answer
-	if i := strings.Index(answer, "ip="); i >= 0 {
-		egress = answer[i+3:]
+	if _, after, ok := strings.Cut(answer, "ip="); ok {
+		egress = after
 	}
 	if ip := net.ParseIP(strings.TrimSpace(egress)); ip != nil {
 		fmt.Printf("PROOF: tunnel egress is %s (a WARP address)\n", ip)
@@ -143,22 +143,25 @@ func buildIPv4(src, dst string, payload []byte) []byte {
 	total := 20 + len(payload)
 	h := make([]byte, 20)
 	h[0] = 0x45 // version 4, IHL 5
-	binary.BigEndian.PutUint16(h[2:], uint16(total))
-	h[4], h[5] = 0x1f, 0x9f // arbitrary identification
-	h[6], h[7] = 0x40, 0x00 // DF
-	h[8] = 64               // TTL
-	h[9] = 17               // UDP
+	// Payload is a DNS query, far below the 64 KiB IP limit.
+	binary.BigEndian.PutUint16(h[2:], uint16(total)) // #nosec G115 -- bounded by DNS query size
+	h[4], h[5] = 0x1f, 0x9f                          // arbitrary identification
+	h[6], h[7] = 0x40, 0x00                          // DF
+	h[8] = 64                                        // TTL
+	h[9] = 17                                        // UDP
 	copy(h[12:16], net.ParseIP(src).To4())
 	copy(h[16:20], net.ParseIP(dst).To4())
 	sum := ipv4Checksum(h)
-	h[10], h[11] = byte(sum>>8), byte(sum)
+	h[10], h[11] = byte(sum>>8), byte(sum) // #nosec G115 -- uint16 halves, no truncation
 	return h
 }
 
 func ipv4Checksum(h []byte) uint16 {
 	var sum uint32
-	for i := 0; i < len(h); i += 2 {
-		sum += uint32(h[i])<<8 | uint32(h[i+1])
+	// h is always the even-length 20-byte header; the i+1 bound only guards
+	// a malformed future caller.
+	for i := 0; i+1 < len(h); i += 2 {
+		sum += uint32(h[i])<<8 | uint32(h[i+1]) // #nosec G602 -- bound checked above
 	}
 	for sum > 0xffff {
 		sum = (sum & 0xffff) + (sum >> 16)
@@ -171,45 +174,65 @@ func buildUDP(srcPort, dstPort uint16, payload []byte) []byte {
 	h := make([]byte, 8)
 	binary.BigEndian.PutUint16(h[0:], srcPort)
 	binary.BigEndian.PutUint16(h[2:], dstPort)
-	binary.BigEndian.PutUint16(h[4:], uint16(8+len(payload)))
+	// Payload is a DNS query, far below the 64 KiB UDP limit.
+	binary.BigEndian.PutUint16(h[4:], uint16(8+len(payload))) // #nosec G115 -- bounded by DNS query size
 	return append(h, payload...)
 }
 
 // buildDNSQuery encodes one recursive TXT query for name.
 func buildDNSQuery(name string) []byte {
 	var b bytes.Buffer
-	binary.Write(&b, binary.BigEndian, uint16(0x2b1f)) // id
-	binary.Write(&b, binary.BigEndian, uint16(0x0100)) // RD
-	binary.Write(&b, binary.BigEndian, uint16(1))      // QDCOUNT
-	binary.Write(&b, binary.BigEndian, uint16(0))      // ANCOUNT
-	binary.Write(&b, binary.BigEndian, uint16(0))      // NSCOUNT
-	binary.Write(&b, binary.BigEndian, uint16(0))      // ARCOUNT
+	// A bytes.Buffer write never fails, so the error carries no information.
+	_ = binary.Write(&b, binary.BigEndian, uint16(0x2b1f)) // id
+	_ = binary.Write(&b, binary.BigEndian, uint16(0x0100)) // RD
+	_ = binary.Write(&b, binary.BigEndian, uint16(1))      // QDCOUNT
+	_ = binary.Write(&b, binary.BigEndian, uint16(0))      // ANCOUNT
+	_ = binary.Write(&b, binary.BigEndian, uint16(0))      // NSCOUNT
+	_ = binary.Write(&b, binary.BigEndian, uint16(0))      // ARCOUNT
 	for label := range strings.SplitSeq(name, ".") {
-		b.WriteByte(byte(len(label)))
+		b.WriteByte(byte(len(label))) // #nosec G115 -- literal names, labels < 64 bytes
 		b.WriteString(label)
 	}
 	b.WriteByte(0)
-	binary.Write(&b, binary.BigEndian, uint16(16)) // TXT
-	binary.Write(&b, binary.BigEndian, uint16(3))  // CHAOS: whoami.cloudflare answers in CH class
+	_ = binary.Write(&b, binary.BigEndian, uint16(16)) // TXT
+	_ = binary.Write(&b, binary.BigEndian, uint16(3))  // CHAOS: whoami.cloudflare answers in CH class
 	return b.Bytes()
 }
 
 // parseDNSAnswer extracts the first TXT string of a DNS response; ok is
 // false for any other packet.
 func parseDNSAnswer(resp []byte) (string, bool) {
-	if len(resp) < 28 {
+	d, ok := dnsPayload(resp)
+	if !ok {
 		return "", false
+	}
+	off, ok := skipDNSQuestion(d)
+	if !ok {
+		return "", false
+	}
+	return firstTXTAnswer(d, off)
+}
+
+// dnsPayload strips the IP+UDP headers and validates the DNS id.
+func dnsPayload(resp []byte) ([]byte, bool) {
+	if len(resp) < 28 {
+		return nil, false
 	}
 	ihl := int(resp[0]&0x0f) * 4
 	if int(resp[9]) != 17 || len(resp) < ihl+8 {
-		return "", false
+		return nil, false
 	}
 	d := resp[ihl+8:]
 	if len(d) < 12 || d[0] != 0x2b || d[1] != 0x1f { // our DNS id
-		return "", false
+		return nil, false
 	}
+	return d, true
+}
+
+// skipDNSQuestion positions the offset at the answer section and reports
+// whether the message is a response (QR set).
+func skipDNSQuestion(d []byte) (int, bool) {
 	qr := d[2]&0x80 != 0
-	ancount := int(binary.BigEndian.Uint16(d[6:8]))
 	off := 12
 	// Skip the question section.
 	for d[off] != 0 {
@@ -220,9 +243,13 @@ func parseDNSAnswer(resp []byte) (string, bool) {
 		off += int(d[off]) + 1
 	}
 	off += 5 // terminating zero + qtype + qclass
-	if !qr {
-		return "", false
-	}
+	return off, qr
+}
+
+// firstTXTAnswer walks the answer records from off and returns the first
+// TXT string.
+func firstTXTAnswer(d []byte, off int) (string, bool) {
+	ancount := int(binary.BigEndian.Uint16(d[6:8]))
 	for i := 0; i < ancount && off+10 <= len(d); i++ {
 		if d[off]&0xc0 == 0 {
 			for d[off] != 0 {

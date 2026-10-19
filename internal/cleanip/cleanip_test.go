@@ -119,12 +119,12 @@ func TestScanHostPortsRanksAndFormats(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln443.Close()
+	defer ln443.Close() //nolint:errcheck // test teardown
 	ln8443, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln8443.Close()
+	defer ln8443.Close() //nolint:errcheck // test teardown
 	go accept(ln443)
 	go accept(ln8443)
 
@@ -156,7 +156,7 @@ func accept(ln net.Listener) {
 		if err != nil {
 			return
 		}
-		conn.Close()
+		_ = conn.Close()
 	}
 }
 

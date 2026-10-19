@@ -33,9 +33,9 @@ func startHTTPProxy(t *testing.T, up *Upstream) (addr string) {
 	if err != nil {
 		t.Fatalf("listen http proxy: %v", err)
 	}
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { _ = ln.Close() })
 	srv := &http.Server{Handler: &HTTPServer{Upstream: up}}
-	go srv.Serve(ln)
+	go func() { _ = srv.Serve(ln) }()
 	return ln.Addr().String()
 }
 
@@ -45,15 +45,15 @@ func startSOCKSProxy(t *testing.T, up *Upstream) (addr string) {
 	if err != nil {
 		t.Fatalf("listen socks proxy: %v", err)
 	}
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { _ = ln.Close() })
 	s := &SOCKSServer{Upstream: up}
-	go s.Serve(ln)
+	go func() { _ = s.Serve(ln) }()
 	return ln.Addr().String()
 }
 
 func TestHTTPProxyConnectThroughUpstream(t *testing.T) {
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, "hello-via-warp")
+		_, _ = io.WriteString(w, "hello-via-warp")
 	}))
 	defer target.Close()
 
@@ -70,7 +70,7 @@ func TestHTTPProxyConnectThroughUpstream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET via proxy: %v", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // test teardown
 	body, _ := io.ReadAll(resp.Body)
 	if string(body) != "hello-via-warp" {
 		t.Errorf("body = %q, want hello-via-warp", body)
@@ -79,7 +79,7 @@ func TestHTTPProxyConnectThroughUpstream(t *testing.T) {
 
 func TestHTTPProxyPlainForward(t *testing.T) {
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, "plain-ok")
+		_, _ = io.WriteString(w, "plain-ok")
 	}))
 	defer target.Close()
 
@@ -97,7 +97,7 @@ func TestHTTPProxyPlainForward(t *testing.T) {
 	if err != nil {
 		t.Fatalf("plain GET via proxy: %v", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // test teardown
 	body, _ := io.ReadAll(resp.Body)
 	if string(body) != "plain-ok" {
 		t.Errorf("body = %q, want plain-ok", body)
@@ -106,7 +106,7 @@ func TestHTTPProxyPlainForward(t *testing.T) {
 
 func TestSOCKSProxyThroughUpstream(t *testing.T) {
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, "socks-ok")
+		_, _ = io.WriteString(w, "socks-ok")
 	}))
 	defer target.Close()
 
@@ -122,7 +122,7 @@ func TestSOCKSProxyThroughUpstream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("socks dial: %v", err)
 	}
-	defer conn.Close()
+	defer conn.Close() //nolint:errcheck // test teardown
 
 	req, _ := http.NewRequest("GET", target.URL, nil)
 	if err := req.Write(conn); err != nil {
@@ -132,7 +132,7 @@ func TestSOCKSProxyThroughUpstream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read response: %v", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // test teardown
 	body, _ := io.ReadAll(resp.Body)
 	if string(body) != "socks-ok" {
 		t.Errorf("body = %q, want socks-ok", body)
@@ -146,7 +146,7 @@ func TestUpstreamDialFailureReturnsError(t *testing.T) {
 		t.Fatalf("listen: %v", err)
 	}
 	closed := ln.Addr().String()
-	ln.Close()
+	_ = ln.Close()
 
 	up := &Upstream{
 		DialFunc: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -175,7 +175,7 @@ func mustDial(t *testing.T, hostPort string) net.Listener {
 	if err != nil {
 		t.Fatalf("listen relay: %v", err)
 	}
-	t.Cleanup(func() { dialLn.Close() })
+	t.Cleanup(func() { _ = dialLn.Close() })
 	// Relay every accepted connection to the target host.
 	go func() {
 		for {
@@ -186,15 +186,15 @@ func mustDial(t *testing.T, hostPort string) net.Listener {
 			go func(src net.Conn) {
 				dst, err := net.Dial("tcp", hostPort)
 				if err != nil {
-					src.Close()
+					_ = src.Close()
 					return
 				}
 				done := make(chan struct{}, 2)
-				go func() { io.Copy(dst, src); done <- struct{}{} }()
-				go func() { io.Copy(src, dst); done <- struct{}{} }()
+				go func() { _, _ = io.Copy(dst, src); done <- struct{}{} }()
+				go func() { _, _ = io.Copy(src, dst); done <- struct{}{} }()
 				<-done
-				src.Close()
-				dst.Close()
+				_ = src.Close()
+				_ = dst.Close()
 			}(src)
 		}
 	}()

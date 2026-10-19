@@ -46,26 +46,26 @@ func (s *HTTPServer) serveConnect(w http.ResponseWriter, r *http.Request, client
 	}
 	hj, ok := w.(http.Hijacker)
 	if !ok {
-		upConn.Close()
+		_ = upConn.Close()
 		http.Error(w, "connection hijacking not supported", http.StatusInternalServerError)
 		return
 	}
 	clientConn, rw, err := hj.Hijack()
 	if err != nil {
-		upConn.Close()
+		_ = upConn.Close()
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	// The 200 response must go through rw because Hijack may expose an
 	// already buffered writer.
 	if _, err := rw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
-		clientConn.Close()
-		upConn.Close()
+		_ = clientConn.Close()
+		_ = upConn.Close()
 		return
 	}
 	if err := rw.Flush(); err != nil {
-		clientConn.Close()
-		upConn.Close()
+		_ = clientConn.Close()
+		_ = upConn.Close()
 		return
 	}
 	go tunnel(clientConn, upConn)
@@ -74,15 +74,15 @@ func (s *HTTPServer) serveConnect(w http.ResponseWriter, r *http.Request, client
 // tunnel copies both directions between client and upstream until one side
 // closes, then closes both.
 func tunnel(client, upstream net.Conn) {
-	defer client.Close()
-	defer upstream.Close()
+	defer client.Close()   //nolint:errcheck // best-effort teardown
+	defer upstream.Close() //nolint:errcheck // best-effort teardown
 	done := make(chan struct{}, 2)
 	go func() {
-		io.Copy(client, upstream)
+		_, _ = io.Copy(client, upstream)
 		done <- struct{}{}
 	}()
 	go func() {
-		io.Copy(upstream, client)
+		_, _ = io.Copy(upstream, client)
 		done <- struct{}{}
 	}()
 	<-done
@@ -103,10 +103,10 @@ func (s *HTTPServer) serveForward(w http.ResponseWriter, r *http.Request, client
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // copy failure surfaces to the client
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	_, _ = io.Copy(w, resp.Body)
 }
 
 func (s *HTTPServer) noteRequest(kind, client, target string) {

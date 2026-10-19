@@ -274,7 +274,7 @@ func fetch(ctx context.Context, client *http.Client, url string) ([]byte, error)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // read failure surfaces below
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GET %s: status %s", url, resp.Status)
 	}

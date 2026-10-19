@@ -25,23 +25,35 @@ func TestRetryAfterParsing(t *testing.T) {
 		}
 		return r
 	}
-	if d, ok := retryAfter(mk("3"), time.Now()); !ok || d != 3*time.Second {
-		t.Errorf("seconds parse = %v ok=%v, want 3s", d, ok)
+	futureDate := time.Now().Add(2 * time.Second).UTC().Format(http.TimeFormat)
+	tests := []struct {
+		name   string
+		header string
+		want   time.Duration
+		wantOK bool
+	}{
+		{"seconds", "3", 3 * time.Second, true},
+		{"capped", "9999", maxRetryWait, true},
+		{"negative", "-5", 0, true},
+		{"http date", futureDate, -1, true}, // -1: any positive, checked below
+		{"missing", "", 0, false},
+		{"garbage", "garbage", 0, false},
 	}
-	if d, ok := retryAfter(mk("9999"), time.Now()); !ok || d != maxRetryWait {
-		t.Errorf("cap = %v ok=%v, want %v", d, ok, maxRetryWait)
-	}
-	if d, ok := retryAfter(mk("-5"), time.Now()); !ok || d != 0 {
-		t.Errorf("negative = %v ok=%v, want 0", d, ok)
-	}
-	if d, ok := retryAfter(mk(time.Now().Add(2*time.Second).UTC().Format(http.TimeFormat)), time.Now()); !ok || d <= 0 || d > maxRetryWait {
-		t.Errorf("date parse = %v ok=%v", d, ok)
-	}
-	if _, ok := retryAfter(mk(""), time.Now()); ok {
-		t.Error("missing header reported parsable")
-	}
-	if _, ok := retryAfter(mk("garbage"), time.Now()); ok {
-		t.Error("garbage header reported parsable")
+	for _, tt := range tests {
+		d, ok := retryAfter(mk(tt.header), time.Now())
+		if ok != tt.wantOK {
+			t.Errorf("%s: ok=%v, want %v", tt.name, ok, tt.wantOK)
+			continue
+		}
+		if tt.want == -1 {
+			if d <= 0 || d > maxRetryWait {
+				t.Errorf("%s: date parse = %v, want (0,%v]", tt.name, d, maxRetryWait)
+			}
+			continue
+		}
+		if d != tt.want {
+			t.Errorf("%s: parse = %v, want %v", tt.name, d, tt.want)
+		}
 	}
 }
 
@@ -131,14 +143,14 @@ func TestHealthNotProxied(t *testing.T) {
 	var upstreamHits atomic.Int32
 	bridge := fixture(t, func(w http.ResponseWriter, r *http.Request) {
 		upstreamHits.Add(1)
-		io.WriteString(w, `{"ok":true}`)
+		_, _ = io.WriteString(w, `{"ok":true}`)
 	}, &atomic.Int32{})
 
 	resp, err := http.Get(bridge.URL + "/health")
 	if err != nil {
 		t.Fatalf("GET /health: %v", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // test teardown
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("status = %d, want 200", resp.StatusCode)
 	}
@@ -155,7 +167,7 @@ func TestHealthNotProxied(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET /health/check: %v", err)
 	}
-	defer resp2.Body.Close()
+	defer resp2.Body.Close() //nolint:errcheck // test teardown
 	if n := upstreamHits.Load(); n != 1 {
 		t.Errorf("upstream hits = %d, want 1 for /health/check", n)
 	}
@@ -167,7 +179,7 @@ func TestForwardsAndPreservesHeaders(t *testing.T) {
 		gotPath = r.URL.Path
 		gotAuth = r.Header.Get("Authorization")
 		gotCT = r.Header.Get("Content-Type")
-		io.WriteString(w, `{"ok":true}`)
+		_, _ = io.WriteString(w, `{"ok":true}`)
 	}, &atomic.Int32{})
 
 	req, _ := http.NewRequest("POST", bridge.URL+"/v1/chat/completions",
@@ -178,7 +190,7 @@ func TestForwardsAndPreservesHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // test teardown
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 || string(body) != `{"ok":true}` {
 		t.Errorf("status=%d body=%q", resp.StatusCode, body)
@@ -202,11 +214,11 @@ func TestReplaysWithRotationOnUsageLimit(t *testing.T) {
 			sawFirstBody.Store(string(body) == `{"prompt":"hi"}`)
 			w.Header().Set("Retry-After", "0")
 			w.WriteHeader(429)
-			io.WriteString(w, `{"error":{"type":"FreeUsageLimitError"}}`)
+			_, _ = io.WriteString(w, `{"error":{"type":"FreeUsageLimitError"}}`)
 			return
 		}
 		sawReplayBody.Store(string(body) == `{"prompt":"hi"}`)
-		io.WriteString(w, `{"ok":true}`)
+		_, _ = io.WriteString(w, `{"ok":true}`)
 	}, rotations)
 
 	resp, err := http.Post(bridge.URL+"/v1/chat/completions", "application/json",
@@ -214,7 +226,7 @@ func TestReplaysWithRotationOnUsageLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // test teardown
 	respBody, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode != 200 || string(respBody) != `{"ok":true}` {
@@ -239,14 +251,14 @@ func TestNonRetryableStatusPassesThrough(t *testing.T) {
 			t.Error("unexpected replay")
 		}
 		w.WriteHeader(403)
-		io.WriteString(w, `denied`)
+		_, _ = io.WriteString(w, `denied`)
 	}, rotations)
 
 	resp, err := http.Get(bridge.URL + "/v1/models")
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // test teardown
 	if resp.StatusCode != 403 {
 		t.Errorf("status = %d, want 403", resp.StatusCode)
 	}
@@ -270,7 +282,7 @@ func TestGivesUpAfterAttempts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != 429 {
 		t.Errorf("status = %d, want 429", resp.StatusCode)
 	}
@@ -290,10 +302,10 @@ func TestPlain429RetriesWithoutRotation(t *testing.T) {
 		if calls.Add(1) == 1 {
 			w.Header().Set("Retry-After", "0")
 			w.WriteHeader(429)
-			io.WriteString(w, `{"error":{"type":"RateLimitError"}}`)
+			_, _ = io.WriteString(w, `{"error":{"type":"RateLimitError"}}`)
 			return
 		}
-		io.WriteString(w, `{"ok":true}`)
+		_, _ = io.WriteString(w, `{"ok":true}`)
 	}, rotations)
 
 	resp, err := http.Post(bridge.URL+"/v1/chat/completions", "application/json",
@@ -301,7 +313,7 @@ func TestPlain429RetriesWithoutRotation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // test teardown
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 || string(respBody) != `{"ok":true}` {
 		t.Errorf("status=%d body=%q, want 200/ok", resp.StatusCode, respBody)
@@ -321,7 +333,7 @@ func TestOversizedBodyRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Errorf("status = %d, want 413", resp.StatusCode)
 	}
@@ -341,9 +353,9 @@ func TestJSONCallerGetsAggregatedStream(t *testing.T) {
 			t.Error("upstream did not receive stream:true")
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		io.WriteString(w, "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,"+
+		_, _ = io.WriteString(w, "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,"+
 			"\"delta\":{\"content\":\"hi there\"},\"finish_reason\":\"stop\"}]}\n\n")
-		io.WriteString(w, "data: [DONE]\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
 	}, func(context.Context) error { return nil }, true, 0, false)
 
 	resp, err := http.Post(bridge.URL+"/v1/chat/completions", "application/json",
@@ -351,7 +363,7 @@ func TestJSONCallerGetsAggregatedStream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // test teardown
 	out, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
 		t.Fatalf("status = %d body=%s", resp.StatusCode, out)
@@ -382,7 +394,7 @@ func TestAnthropicMessagesEndToEnd(t *testing.T) {
 		gotPath = r.URL.Path
 		gotUA = r.Header.Get("User-Agent")
 		w.Header().Set("Content-Type", "text/event-stream")
-		io.WriteString(w, "data: {\"id\":\"c9\",\"model\":\"big-pickle\",\"choices\":["+""+
+		_, _ = io.WriteString(w, "data: {\"id\":\"c9\",\"model\":\"big-pickle\",\"choices\":["+""+
 			"{\"index\":0,\"delta\":{\"content\":\"translated\"},\"finish_reason\":\"stop\"}]}\n\n")
 	}, func(context.Context) error { return nil }, true, 0, false)
 
@@ -394,7 +406,7 @@ func TestAnthropicMessagesEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // test teardown
 	out, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode != 200 {
@@ -428,7 +440,7 @@ func TestAnthropicMessagesEndToEnd(t *testing.T) {
 // Anthropic clients expect.
 func TestModelsListsFreeOnlyWithBothFlavors(t *testing.T) {
 	bridge := startBridge(t, func(w http.ResponseWriter, _ *http.Request) {
-		io.WriteString(w, `{"object":"list","data":[
+		_, _ = io.WriteString(w, `{"object":"list","data":[
 			{"id":"big-pickle","object":"model","created":1,"owned_by":"opencode"},
 			{"id":"minimax-m3.1-flash-free","object":"model","created":1,"owned_by":"opencode"},
 			{"id":"jev-1.13","object":"model","created":1,"owned_by":"opencode"},
@@ -440,7 +452,7 @@ func TestModelsListsFreeOnlyWithBothFlavors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // test teardown
 	out, _ := io.ReadAll(resp.Body)
 	var list struct {
 		Data []map[string]any `json:"data"`
@@ -508,7 +520,7 @@ func TestPublicProxyFallbackAfterExhaustedRetries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // test teardown
 	body, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode != 200 || string(body) != `{"via":"public"}` {

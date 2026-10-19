@@ -204,8 +204,8 @@ func (m *Manager) rrDialerLocked() Dialer {
 	if n == 0 {
 		return nil
 	}
-	start := int(m.rrCounter.Add(1)) - 1
-	for i := 0; i < n; i++ {
+	start := int(m.rrCounter.Add(1)) - 1 // #nosec G115 -- 64-bit counter, overflow unreachable
+	for i := range n {
 		if w := m.workers[(start+i)%n]; w != nil && w.d != nil {
 			return w.d
 		}
@@ -260,7 +260,7 @@ func (m *Manager) Reconnect(ctx context.Context) error {
 	if m.poolSize() > 1 {
 		next = (m.active + 1) % m.poolSize()
 	}
-	if err := m.connectLocked(ctx, next, m.endpoint); err != nil {
+	if err := m.refreshLocked(ctx, next); err != nil {
 		return err
 	}
 	if next != m.active {
@@ -389,13 +389,6 @@ func (m *Manager) activeWorkerLocked() *worker {
 	return nil
 }
 
-// bringUpLocked ensures the active account has a tunnel. Other accounts
-// keep only their identity files; their tunnels open on rotation.
-func (m *Manager) bringUpLocked(ctx context.Context, endpoint string) error {
-	m.ensureWorkersLocked()
-	return m.connectLocked(ctx, m.active, endpoint)
-}
-
 // ensureWorkersLocked allocates the worker slots when missing, so a
 // Reconnect before EnsureReady cannot index an empty pool.
 func (m *Manager) ensureWorkersLocked() {
@@ -490,7 +483,7 @@ func (m *Manager) registerIdentity(ctx context.Context) (*masque.Identity, error
 func (m *Manager) swap(i int, id *masque.Identity, tun Tunnel, d Dialer) {
 	w := m.workers[i]
 	if w.tun != nil {
-		w.tun.Close()
+		_ = w.tun.Close() //nolint:errcheck // best-effort teardown
 	}
 	w.id = id
 	w.tun = tun
@@ -509,7 +502,7 @@ func (m *Manager) connectTunnel(ctx context.Context, id *masque.Identity,
 	}
 	nd, err := masque.NewNetstackDialer(tun, id)
 	if err != nil {
-		tun.Close()
+		_ = tun.Close() //nolint:errcheck // best-effort teardown
 		return nil, nil, err
 	}
 	return tun, nd, nil
@@ -556,6 +549,16 @@ func (m *Manager) ReconnectWorker(ctx context.Context, i int) error {
 	if i < 0 || i >= len(m.workers) {
 		return fmt.Errorf("worker %d out of range", i)
 	}
+	return m.refreshLocked(ctx, i)
+}
+
+// refreshLocked reconnects worker i: in reregister mode it first deletes the
+// worker's registration and starts over with a fresh identity, otherwise it
+// reuses the stored identity. The caller must hold m.mu.
+func (m *Manager) refreshLocked(ctx context.Context, i int) error {
+	if m.mode == ModeReregister {
+		return m.reregisterLocked(ctx, i)
+	}
 	return m.connectLocked(ctx, i, m.endpoint)
 }
 
@@ -573,9 +576,7 @@ func (m *Manager) Egresses(ctx context.Context) map[int]string {
 	m.egress = ips
 	m.mu.Unlock()
 	out := make(map[int]string, len(ips))
-	for i, ip := range ips {
-		out[i] = ip
-	}
+	maps.Copy(out, ips)
 	return out
 }
 
@@ -584,9 +585,7 @@ func (m *Manager) CachedEgresses() map[int]string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	out := make(map[int]string, len(m.egress))
-	for i, ip := range m.egress {
-		out[i] = ip
-	}
+	maps.Copy(out, m.egress)
 	return out
 }
 
@@ -615,12 +614,12 @@ func (m *Manager) measureEgress(ctx context.Context, i int) string {
 	if err != nil {
 		return ""
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // read failure surfaces below
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if err != nil || resp.StatusCode != http.StatusOK {
 		return ""
 	}
-	for _, line := range strings.Split(string(body), "\n") {
+	for line := range strings.SplitSeq(string(body), "\n") {
 		if ip, ok := strings.CutPrefix(line, "ip="); ok {
 			return strings.TrimSpace(ip)
 		}
@@ -642,7 +641,7 @@ func (m *Manager) DedupeEgress(ctx context.Context, passes int, gate *RotationGa
 		return 0, fmt.Errorf("egress dedupe requires distribution=%s", DistributionRoundRobin)
 	}
 	rotated := 0
-	for p := 0; p < passes; p++ {
+	for range passes {
 		colliders := egressColliders(m.Egresses(ctx))
 		if len(colliders) == 0 {
 			break

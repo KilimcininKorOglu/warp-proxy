@@ -20,19 +20,20 @@ const dnsID uint16 = 0x2b1f
 // class (e.g. type A class IN, or type TXT class CHAOS).
 func buildDNSQuery(name string, qtype, qclass uint16) []byte {
 	var b bytes.Buffer
-	binary.Write(&b, binary.BigEndian, dnsID)
-	binary.Write(&b, binary.BigEndian, uint16(0x0100)) // RD
-	binary.Write(&b, binary.BigEndian, uint16(1))      // QDCOUNT
-	binary.Write(&b, binary.BigEndian, uint16(0))      // ANCOUNT
-	binary.Write(&b, binary.BigEndian, uint16(0))      // NSCOUNT
-	binary.Write(&b, binary.BigEndian, uint16(0))      // ARCOUNT
-	for _, label := range strings.Split(name, ".") {
-		b.WriteByte(byte(len(label)))
+	// A bytes.Buffer write never fails, so the error carries no information.
+	_ = binary.Write(&b, binary.BigEndian, dnsID)
+	_ = binary.Write(&b, binary.BigEndian, uint16(0x0100)) // RD
+	_ = binary.Write(&b, binary.BigEndian, uint16(1))      // QDCOUNT
+	_ = binary.Write(&b, binary.BigEndian, uint16(0))      // ANCOUNT
+	_ = binary.Write(&b, binary.BigEndian, uint16(0))      // NSCOUNT
+	_ = binary.Write(&b, binary.BigEndian, uint16(0))      // ARCOUNT
+	for label := range strings.SplitSeq(name, ".") {
+		b.WriteByte(byte(len(label))) // #nosec G115 -- resolver names, labels < 64 bytes
 		b.WriteString(label)
 	}
 	b.WriteByte(0)
-	binary.Write(&b, binary.BigEndian, qtype)
-	binary.Write(&b, binary.BigEndian, qclass)
+	_ = binary.Write(&b, binary.BigEndian, qtype)
+	_ = binary.Write(&b, binary.BigEndian, qclass)
 	return b.Bytes()
 }
 
@@ -102,7 +103,7 @@ func parseRecords(d []byte, rtype, size int) ([]net.IP, error) {
 func eachAnswer(d []byte, visit func(rtype uint16, data []byte)) {
 	ancount := int(binary.BigEndian.Uint16(d[6:8]))
 	off := skipQuestion(d)
-	for i := 0; i < ancount; i++ {
+	for range ancount {
 		if off+10 > len(d) {
 			return
 		}
@@ -121,25 +122,10 @@ func eachAnswer(d []byte, visit func(rtype uint16, data []byte)) {
 	}
 }
 
-// parseDNSAnswerTXT returns the first TXT string of an IP-framed response.
-func parseDNSAnswerTXT(resp []byte) (string, error) {
-	d, err := dnsAnswerBody(resp)
-	if err != nil {
-		return "", err
-	}
-	return parseTXTFromMessage(d)
-}
-
 // parseTXTFromMessage returns the first TXT string of a bare DNS message.
 func parseTXTFromMessage(d []byte) (string, error) {
-	if len(d) < 12 || d[0] != byte(dnsID>>8&0xff) || d[1] != byte(dnsID&0xff) {
-		return "", errNotOurDNS
-	}
-	if d[2]&0x80 == 0 {
-		return "", errNotOurDNS
-	}
-	if rcode := d[3] & 0x0f; rcode != 0 {
-		return "", fmt.Errorf("dns rcode %d", rcode)
+	if err := validateDNSResponse(d); err != nil {
+		return "", err
 	}
 	ancount := int(binary.BigEndian.Uint16(d[6:8]))
 	off := skipQuestion(d)
@@ -148,21 +134,46 @@ func parseTXTFromMessage(d []byte) (string, error) {
 		if off+10 > len(d) {
 			break
 		}
-		rtype := binary.BigEndian.Uint16(d[off:])
 		rdlen := int(binary.BigEndian.Uint16(d[off+8:]))
 		off += 10
-		if rtype == 16 && rdlen > 0 && off+rdlen <= len(d) {
-			n := int(d[off])
-			if n > 0 && off+1+n <= off+rdlen {
-				return string(d[off+1 : off+1+n]), nil
-			}
+		if txt, ok := firstTXTString(d, off, rdlen); ok {
+			return txt, nil
 		}
 		off += rdlen
 	}
 	return "", errors.New("no TXT record in answer")
 }
 
-// dnsAnswerBody validates the response header and returns the DNS payload.
+// validateDNSResponse checks the id, the QR flag and the rcode.
+func validateDNSResponse(d []byte) error {
+	if len(d) < 12 || d[0] != byte(dnsID>>8&0xff) || d[1] != byte(dnsID&0xff) {
+		return errNotOurDNS
+	}
+	if d[2]&0x80 == 0 {
+		return errNotOurDNS
+	}
+	if rcode := d[3] & 0x0f; rcode != 0 {
+		return fmt.Errorf("dns rcode %d", rcode)
+	}
+	return nil
+}
+
+// firstTXTString reads the first <len>string of a TXT record at off; ok is
+// false for any other record type or a malformed one.
+func firstTXTString(d []byte, off, rdlen int) (string, bool) {
+	rtype := binary.BigEndian.Uint16(d[off-10:])
+	if rtype != 16 || rdlen <= 0 || off+rdlen > len(d) {
+		return "", false
+	}
+	n := int(d[off])
+	if n > 0 && off+1+n <= off+rdlen {
+		return string(d[off+1 : off+1+n]), true
+	}
+	return "", false
+}
+
+// dnsAnswerBody strips the IPv4+UDP frame from a tunnel datagram response
+// and validates the DNS header underneath.
 func dnsAnswerBody(resp []byte) ([]byte, error) {
 	if len(resp) < 20 {
 		return nil, errNotOurDNS

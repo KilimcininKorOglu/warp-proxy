@@ -69,15 +69,7 @@ func (s *Server) doCleanIPScan(w http.ResponseWriter, r *http.Request) {
 // fields. bad reports an unusable value.
 func applyEndpoint(r *http.Request) (string, bool) {
 	if combined := r.FormValue("ip"); strings.Contains(combined, ":") {
-		host, port, err := net.SplitHostPort(combined)
-		if err != nil || net.ParseIP(host) == nil {
-			return "", true
-		}
-		p, perr := strconv.Atoi(port)
-		if perr != nil || p < 1 || p > 65535 {
-			return "", true
-		}
-		return net.JoinHostPort(host, port), false
+		return applyCombinedEndpoint(combined)
 	}
 	ip := net.ParseIP(r.FormValue("ip"))
 	port, err := strconv.Atoi(r.FormValue("port"))
@@ -85,6 +77,19 @@ func applyEndpoint(r *http.Request) (string, bool) {
 		return "", true
 	}
 	return net.JoinHostPort(ip.String(), strconv.Itoa(port)), false
+}
+
+// applyCombinedEndpoint normalizes a combined "host:port" form value.
+func applyCombinedEndpoint(combined string) (string, bool) {
+	host, port, err := net.SplitHostPort(combined)
+	if err != nil || net.ParseIP(host) == nil {
+		return "", true
+	}
+	p, perr := strconv.Atoi(port)
+	if perr != nil || p < 1 || p > 65535 {
+		return "", true
+	}
+	return net.JoinHostPort(host, port), false
 }
 
 // doCleanIPApply pins the chosen edge endpoint and reconnects WARP.

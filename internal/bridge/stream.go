@@ -1,6 +1,8 @@
 package bridge
 
 import (
+	"fmt"
+
 	"bufio"
 	"encoding/json"
 	"io"
@@ -69,26 +71,25 @@ func isSSE(resp *http.Response) bool {
 
 // aggregateSSE drains an OpenAI-style chat.completion.chunk stream into one
 // aggregated completion. Unparsable data lines (keep-alives, comments) are
-// skipped.
-func aggregateSSE(r io.Reader) aggregated {
+// skipped; a read error aborts with a partial aggregate and the error.
+func aggregateSSE(r io.Reader) (aggregated, error) {
 	var agg aggregated
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 64<<10), 1<<20)
 	for sc.Scan() {
 		applyChunk(&agg, sc.Text())
 	}
-	return agg
+	if err := sc.Err(); err != nil {
+		return agg, fmt.Errorf("read upstream stream: %w", err)
+	}
+	return agg, nil
 }
 
 // applyChunk merges one SSE line into the aggregate; non-data and unparsable
 // lines are ignored.
 func applyChunk(agg *aggregated, line string) {
-	data, ok := strings.CutPrefix(strings.TrimSpace(line), "data:")
+	data, ok := chunkData(line)
 	if !ok {
-		return
-	}
-	data = strings.TrimSpace(data)
-	if data == "" || data == "[DONE]" {
 		return
 	}
 	var chunk struct {
@@ -109,22 +110,57 @@ func applyChunk(agg *aggregated, line string) {
 	if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 		return
 	}
+	mergeChunkMeta(agg, chunk.ID, chunk.Model, chunk.Usage)
+	mergeChoices(agg, chunk.Choices)
+}
+
+// chunkData extracts the payload of a data: SSE line; ok is false for
+// non-data, empty and [DONE] lines.
+func chunkData(line string) (string, bool) {
+	data, ok := strings.CutPrefix(strings.TrimSpace(line), "data:")
+	if !ok {
+		return "", false
+	}
+	data = strings.TrimSpace(data)
+	if data == "" || data == "[DONE]" {
+		return "", false
+	}
+	return data, true
+}
+
+// mergeChunkMeta carries the chunk's id, model and usage into the aggregate
+// when they are still unset or present.
+func mergeChunkMeta(agg *aggregated, id, model string,
+	usage *struct {
+		PromptTokens     int64 `json:"prompt_tokens"`
+		CompletionTokens int64 `json:"completion_tokens"`
+	}) {
 	if agg.ID == "" {
-		agg.ID = chunk.ID
+		agg.ID = id
 	}
 	if agg.Model == "" {
-		agg.Model = chunk.Model
+		agg.Model = model
 	}
-	for _, c := range chunk.Choices {
+	if usage != nil {
+		agg.Prompt = usage.PromptTokens
+		agg.Output = usage.CompletionTokens
+	}
+}
+
+// mergeChoices appends the chunk deltas to the aggregate's text.
+func mergeChoices(agg *aggregated, choices []struct {
+	Delta struct {
+		Content          string `json:"content"`
+		ReasoningContent string `json:"reasoning_content"`
+	} `json:"delta"`
+	FinishReason *string `json:"finish_reason"`
+}) {
+	for _, c := range choices {
 		agg.Content += c.Delta.Content
 		agg.Reason += c.Delta.ReasoningContent
 		if c.FinishReason != nil && *c.FinishReason != "" {
 			agg.Finish = *c.FinishReason
 		}
-	}
-	if chunk.Usage != nil {
-		agg.Prompt = chunk.Usage.PromptTokens
-		agg.Output = chunk.Usage.CompletionTokens
 	}
 }
 

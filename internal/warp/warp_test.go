@@ -268,7 +268,7 @@ func TestRoundRobinDialCyclesWorkers(t *testing.T) {
 	}
 
 	var got []string
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		_, err := m.Dial(context.Background(), "tcp", "example.com:80")
 		if err == nil {
 			t.Fatal("dial unexpectedly succeeded on a fake dialer")
@@ -368,7 +368,7 @@ func (d egressDialer) Resolve(context.Context, string) (net.IP, error) {
 func traceServer(t *testing.T, ip *atomic.Pointer[string]) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprintf(w, "fl=x\nip=%s\nwarp=on\n", *ip.Load())
+		_, _ = fmt.Fprintf(w, "fl=x\nip=%s\nwarp=on\n", *ip.Load())
 	}))
 	t.Cleanup(srv.Close)
 	return srv
@@ -376,7 +376,7 @@ func traceServer(t *testing.T, ip *atomic.Pointer[string]) *httptest.Server {
 
 func TestMeasureEgressParsesTraceIP(t *testing.T) {
 	ip := atomic.Pointer[string]{}
-	ip.Store(ptr("203.0.113.9"))
+	ip.Store(new("203.0.113.9"))
 	srv := traceServer(t, &ip)
 	m := NewManager(t.TempDir(), ModeReconnect, 1, DistributionOff)
 	m.register = func(context.Context) (*masque.Identity, error) {
@@ -415,7 +415,7 @@ func TestDedupeRotatesCollidingWorker(t *testing.T) {
 	// Both workers sit on the same egress; the first rotation of worker 1
 	// moves it off.
 	ips := atomic.Pointer[string]{}
-	ips.Store(ptr("104.28.192.58"))
+	ips.Store(new("104.28.192.58"))
 	m.measure = func(_ context.Context, i int) string {
 		if i == 1 && rotated.Load() > 0 {
 			return "104.28.224.60"
@@ -509,8 +509,6 @@ func TestEgressCollidersPicksLaterWorkers(t *testing.T) {
 		t.Errorf("colliders = %v, want %v", got, want)
 	}
 }
-
-func ptr(s string) *string { return &s }
 
 // prefDialer records the IPv6 preference applied to it.
 type prefDialer struct {

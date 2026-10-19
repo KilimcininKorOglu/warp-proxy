@@ -16,13 +16,13 @@ func buildAResponse(name string, ip [4]byte, rcode int) []byte {
 		d.WriteString(label)
 	}
 	d.WriteByte(0)
-	binary.Write(&d, binary.BigEndian, uint16(1)) // qtype A
-	binary.Write(&d, binary.BigEndian, uint16(1)) // qclass IN
-	binary.Write(&d, binary.BigEndian, uint16(0xc00c))
-	binary.Write(&d, binary.BigEndian, uint16(1)) // A
-	binary.Write(&d, binary.BigEndian, uint16(1)) // IN
-	binary.Write(&d, binary.BigEndian, uint32(60))
-	binary.Write(&d, binary.BigEndian, uint16(4))
+	_ = binary.Write(&d, binary.BigEndian, uint16(1)) // qtype A
+	_ = binary.Write(&d, binary.BigEndian, uint16(1)) // qclass IN
+	_ = binary.Write(&d, binary.BigEndian, uint16(0xc00c))
+	_ = binary.Write(&d, binary.BigEndian, uint16(1)) // A
+	_ = binary.Write(&d, binary.BigEndian, uint16(1)) // IN
+	_ = binary.Write(&d, binary.BigEndian, uint32(60))
+	_ = binary.Write(&d, binary.BigEndian, uint16(4))
 	d.Write(ip[:])
 
 	// Frame it as IPv4 + UDP.
@@ -116,13 +116,13 @@ func TestParseDNSAnswerAAAA(t *testing.T) {
 		d.WriteString(label)
 	}
 	d.WriteByte(0)
-	binary.Write(&d, binary.BigEndian, uint16(28)) // qtype AAAA
-	binary.Write(&d, binary.BigEndian, uint16(1))  // IN
-	binary.Write(&d, binary.BigEndian, uint16(0xc00c))
-	binary.Write(&d, binary.BigEndian, uint16(28)) // AAAA
-	binary.Write(&d, binary.BigEndian, uint16(1))  // IN
-	binary.Write(&d, binary.BigEndian, uint32(60))
-	binary.Write(&d, binary.BigEndian, uint16(16))
+	_ = binary.Write(&d, binary.BigEndian, uint16(28)) // qtype AAAA
+	_ = binary.Write(&d, binary.BigEndian, uint16(1))  // IN
+	_ = binary.Write(&d, binary.BigEndian, uint16(0xc00c))
+	_ = binary.Write(&d, binary.BigEndian, uint16(28)) // AAAA
+	_ = binary.Write(&d, binary.BigEndian, uint16(1))  // IN
+	_ = binary.Write(&d, binary.BigEndian, uint32(60))
+	_ = binary.Write(&d, binary.BigEndian, uint16(16))
 	ipv6 := net.ParseIP("2606:4700:4700::1111").To16()
 	d.Write(ipv6)
 

@@ -21,33 +21,15 @@ func fakeAPI(t *testing.T, realPEM string) (*httptest.Server, *[]apiCall) {
 	calls := &[]apiCall{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		*calls = append(*calls, apiCall{method: r.Method, path: r.URL.Path, auth: r.Header.Get("Authorization")})
-		if r.Method == http.MethodPost {
-			var body map[string]string
-			_ = json.NewDecoder(r.Body).Decode(&body)
-			if body["key_type"] != "curve25519" || body["tunnel_type"] != "wireguard" {
-				t.Errorf("step 1 key/tunnel type = %s/%s", body["key_type"], body["tunnel_type"])
-			}
-			if body["serial_number"] == "" || body["tos"] == "" || len(body["key"]) != 44 {
-				t.Errorf("step 1 body incomplete: %v", body)
-			}
-			fmt.Fprintf(w, `{"id":"dev-1","token":"tok-1"}`)
-			return
-		}
 		var body map[string]string
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		if body["key_type"] != "secp256r1" || body["tunnel_type"] != "masque" {
-			t.Errorf("step 2 key/tunnel type = %s/%s", body["key_type"], body["tunnel_type"])
+		if r.Method == http.MethodPost {
+			assertRegisterBody(t, body)
+			_, _ = fmt.Fprintf(w, `{"id":"dev-1","token":"tok-1"}`)
+			return
 		}
-		// The enrolled key must be a real P-256 SPKI.
-		der, err := base64.StdEncoding.DecodeString(body["key"])
-		if err != nil {
-			t.Errorf("enroll key not base64: %v", err)
-		} else if pub, err := x509.ParsePKIXPublicKey(der); err != nil {
-			t.Errorf("enroll key not SPKI: %v", err)
-		} else if _, ok := pub.(*ecdsa.PublicKey); !ok {
-			t.Errorf("enroll key is %T, want *ecdsa.PublicKey", pub)
-		}
-		fmt.Fprintf(w, `{"id":"dev-1","config":{
+		assertEnrollBody(t, body)
+		_, _ = fmt.Fprintf(w, `{"id":"dev-1","config":{
 			"peers":[{"public_key":%q,"endpoint":{"v4":"162.159.198.1:0","v6":"[2606:4700:103::]:0",
 			"ports":[443,500,1701,4500]}}],
 			"interface":{"addresses":{"v4":"100.96.0.3/32","v6":"2606:4700:110::1/128"}}}}`,
@@ -55,6 +37,39 @@ func fakeAPI(t *testing.T, realPEM string) (*httptest.Server, *[]apiCall) {
 	}))
 	t.Cleanup(srv.Close)
 	return srv, calls
+}
+
+// assertRegisterBody checks the throwaway-key registration body.
+func assertRegisterBody(t *testing.T, body map[string]string) {
+	t.Helper()
+	if body["key_type"] != "curve25519" || body["tunnel_type"] != "wireguard" {
+		t.Errorf("step 1 key/tunnel type = %s/%s", body["key_type"], body["tunnel_type"])
+	}
+	if body["serial_number"] == "" || body["tos"] == "" || len(body["key"]) != 44 {
+		t.Errorf("step 1 body incomplete: %v", body)
+	}
+}
+
+// assertEnrollBody checks the masque enroll body carries a real P-256 SPKI.
+func assertEnrollBody(t *testing.T, body map[string]string) {
+	t.Helper()
+	if body["key_type"] != "secp256r1" || body["tunnel_type"] != "masque" {
+		t.Errorf("step 2 key/tunnel type = %s/%s", body["key_type"], body["tunnel_type"])
+	}
+	// The enrolled key must be a real P-256 SPKI.
+	der, err := base64.StdEncoding.DecodeString(body["key"])
+	if err != nil {
+		t.Errorf("enroll key not base64: %v", err)
+		return
+	}
+	pub, err := x509.ParsePKIXPublicKey(der)
+	if err != nil {
+		t.Errorf("enroll key not SPKI: %v", err)
+		return
+	}
+	if _, ok := pub.(*ecdsa.PublicKey); !ok {
+		t.Errorf("enroll key is %T, want *ecdsa.PublicKey", pub)
+	}
 }
 
 type apiCall struct{ method, path, auth string }
@@ -68,18 +83,31 @@ func TestRegisterFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	if len(*calls) != 2 {
-		t.Fatalf("api calls = %d, want 2", len(*calls))
+	assertRegisterCalls(t, *calls)
+	assertIdentityFields(t, id, realPEM)
+	assertRestoredKeypair(t, id)
+}
+
+// assertRegisterCalls checks the two-step API exchange happened in order.
+func assertRegisterCalls(t *testing.T, calls []apiCall) {
+	t.Helper()
+	if len(calls) != 2 {
+		t.Fatalf("api calls = %d, want 2", len(calls))
 	}
-	if (*calls)[0].method != http.MethodPost || (*calls)[0].path != "/v0a4471/reg" {
-		t.Errorf("call 0 = %s %s, want POST /v0a4471/reg", (*calls)[0].method, (*calls)[0].path)
+	if calls[0].method != http.MethodPost || calls[0].path != "/v0a4471/reg" {
+		t.Errorf("call 0 = %s %s, want POST /v0a4471/reg", calls[0].method, calls[0].path)
 	}
-	if (*calls)[1].method != http.MethodPatch || (*calls)[1].path != "/v0a4471/reg/dev-1" {
-		t.Errorf("call 1 = %s %s", (*calls)[1].method, (*calls)[1].path)
+	if calls[1].method != http.MethodPatch || calls[1].path != "/v0a4471/reg/dev-1" {
+		t.Errorf("call 1 = %s %s", calls[1].method, calls[1].path)
 	}
-	if (*calls)[1].auth != "Bearer tok-1" {
-		t.Errorf("enroll auth = %q, want bearer token", (*calls)[1].auth)
+	if calls[1].auth != "Bearer tok-1" {
+		t.Errorf("enroll auth = %q, want bearer token", calls[1].auth)
 	}
+}
+
+// assertIdentityFields checks the enroll response was folded into the identity.
+func assertIdentityFields(t *testing.T, id *Identity, realPEM string) {
+	t.Helper()
 	if id.ID != "dev-1" || id.AccessToken != "tok-1" {
 		t.Errorf("id = %s/%s", id.ID, id.AccessToken)
 	}
@@ -95,16 +123,26 @@ func TestRegisterFlow(t *testing.T) {
 	if id.PeerPubKeyPEM != realPEM {
 		t.Error("peer public key not carried through")
 	}
+	assertEndpointPorts(t, id.EndpointPorts)
+}
+
+// assertEndpointPorts checks the identity kept the enroll's port list.
+func assertEndpointPorts(t *testing.T, got []int) {
+	t.Helper()
 	wantPorts := []int{443, 500, 1701, 4500}
-	if len(id.EndpointPorts) != len(wantPorts) {
-		t.Fatalf("endpoint ports = %v, want %v", id.EndpointPorts, wantPorts)
+	if len(got) != len(wantPorts) {
+		t.Fatalf("endpoint ports = %v, want %v", got, wantPorts)
 	}
 	for i, p := range wantPorts {
-		if id.EndpointPorts[i] != p {
-			t.Errorf("port[%d] = %d, want %d", i, id.EndpointPorts[i], p)
+		if got[i] != p {
+			t.Errorf("port[%d] = %d, want %d", i, got[i], p)
 		}
 	}
-	// The identity must restore into the keypair whose key was enrolled.
+}
+
+// assertRestoredKeypair proves the identity restores the enrolled P-256 key.
+func assertRestoredKeypair(t *testing.T, id *Identity) {
+	t.Helper()
 	kp, err := id.Keypair()
 	if err != nil {
 		t.Fatalf("keypair from identity: %v", err)
@@ -122,7 +160,7 @@ func TestRegisterFlow(t *testing.T) {
 
 func TestRegisterMissingTokenFails(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `{"id":"dev-1"}`)
+		_, _ = fmt.Fprintf(w, `{"id":"dev-1"}`)
 	}))
 	defer srv.Close()
 	c := &Client{baseURL: srv.URL, http: srv.Client()}
@@ -134,7 +172,7 @@ func TestRegisterMissingTokenFails(t *testing.T) {
 func TestRegisterAPIErrorSurfacesBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
-		fmt.Fprint(w, `{"success":false,"errors":[{"code":1020}]}`)
+		_, _ = fmt.Fprint(w, `{"success":false,"errors":[{"code":1020}]}`)
 	}))
 	defer srv.Close()
 	c := &Client{baseURL: srv.URL, http: srv.Client()}

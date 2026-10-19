@@ -44,7 +44,7 @@ func Check(ctx context.Context, c Candidate, checkURL string,
 	if err != nil {
 		return Entry{}, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // read failure surfaces below
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return Entry{}, fmt.Errorf("check status %d", resp.StatusCode)
 	}

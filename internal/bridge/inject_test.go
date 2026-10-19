@@ -199,7 +199,7 @@ func TestBridgeInjectsIdentity(t *testing.T) {
 		gotUA = r.Header.Get("User-Agent")
 		body, _ := io.ReadAll(r.Body)
 		gotNames = toolNames(t, body)
-		io.WriteString(w, `{}`)
+		_, _ = io.WriteString(w, `{}`)
 	}, rotate, true, 0, false)
 
 	req, _ := http.NewRequest("POST", bridge.URL+"/v1/chat/completions",
@@ -210,7 +210,7 @@ func TestBridgeInjectsIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	if !sessionIDPattern.MatchString(gotSession) {
 		t.Errorf("session = %q", gotSession)
@@ -235,11 +235,11 @@ func retryOnceHandler(calls *atomic.Int32, first, replay *[2]string) http.Handle
 			*first = ids
 			w.Header().Set("Retry-After", "0")
 			w.WriteHeader(429)
-			io.WriteString(w, `{"error":{"type":"FreeUsageLimitError"}}`)
+			_, _ = io.WriteString(w, `{"error":{"type":"FreeUsageLimitError"}}`)
 			return
 		}
 		*replay = ids
-		io.WriteString(w, `{}`)
+		_, _ = io.WriteString(w, `{}`)
 	}
 }
 
@@ -259,7 +259,7 @@ func TestRotateSessionOnRetryRefreshesIDs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	if first[0] != clientSession || first[1] != clientRequest {
 		t.Errorf("first attempt ids = %v, want the client values", first)
@@ -292,7 +292,7 @@ func TestRotateSessionOffKeepsClientIDs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	if replay[0] != clientSession {
 		t.Errorf("replay session = %q, want the client value preserved", replay[0])

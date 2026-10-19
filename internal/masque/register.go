@@ -182,7 +182,7 @@ func (c *Client) doJSON(ctx context.Context, method, path, token string,
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // read failure surfaces below
 	text, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("read response: %w", err)
@@ -269,7 +269,7 @@ func resolveViaDoH(ctx context.Context, host string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("doh query %s: %w", host, err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // read failure surfaces below
 	var answer struct {
 		Answer []struct {
 			Type int    `json:"type"` // 1 = A
@@ -311,7 +311,7 @@ func (c *Client) Delete(ctx context.Context, id *Identity) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // status already handled above
 	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusForbidden {
 		return nil
 	}

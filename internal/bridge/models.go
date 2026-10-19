@@ -19,7 +19,7 @@ func (s *Server) serveModels(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bridge upstream failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // read failure surfaces below
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
 	if err != nil {
 		http.Error(w, "read upstream models failed", http.StatusBadGateway)

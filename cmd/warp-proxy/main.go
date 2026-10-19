@@ -51,22 +51,7 @@ func main() {
 	manager := warp.NewManager(cfg.Warp.StateDir, cfg.Warp.ReconnectMode,
 		cfg.Warp.Accounts, cfg.Warp.Distribution)
 	manager.SetIPv6Preference(cfg.Warp.IPv6Preference)
-	upstream := &proxy.Upstream{DialFunc: manager.Dial, Resolve: manager.ResolveIP}
-
-	// Front rewriting: pool fed by the Clean-IP scan, decisions read the
-	// live config on every request.
-	selector := front.NewSelector(func() front.Config {
-		ttl, err := config.ParseDuration(cfg.Front.ResolveCacheTTL)
-		if err != nil {
-			ttl = 10 * time.Minute
-		}
-		return front.Config{
-			Enabled:         cfg.Front.Enabled,
-			Domains:         cfg.Front.Domains,
-			ResolveCacheTTL: ttl,
-		}
-	})
-	upstream.Front = selector.Pick
+	upstream, selector := buildUpstream(cfg, manager)
 
 	// The health checker must see the tunnel as clients experience WARP,
 	// never a front-rewritten edge, so it gets its own plain upstream.
@@ -93,6 +78,10 @@ func main() {
 		checker.Loop(ctx, healthInterval(cfg))
 	}()
 
+	pool := &publicproxy.Pool{}
+	panelScan := make(chan struct{}, 1)
+	go runPublicProxyPool(ctx, pool, panelScan, cfg, logs)
+
 	// Track the current opencode release so the injected free-tier
 	// User-Agent never goes stale (old versions get 426 upstream).
 	go refreshBridgeUserAgent(ctx, logs)
@@ -102,79 +91,17 @@ func main() {
 	// spreads across exit IPs. Every rotation goes through the limiter.
 	go runStartupDedupe(ctx, manager, checker, logs)
 
-	httpSrv := &proxy.HTTPServer{Upstream: upstream, Log: logger, OnRequest: logSink.request}
-	socksSrv := &proxy.SOCKSServer{Upstream: upstream}
+	panel := buildPanel(cfg, manager, checker, logs, logger, pool, panelScan, selector, *configPath)
 
-	// The public proxy pool: scraped lists, verified with real requests,
-	// used by the bridge as the last-resort exit after WARP retries.
-	pool := &publicproxy.Pool{}
-	panelScan := make(chan struct{}, 1)
-	go runPublicProxyPool(ctx, pool, panelScan, cfg, logs)
-
-	panel := web.New()
-	panel.PublicPool = pool
-	panel.PublicScan = panelScan
-	panel.ConfigPath = *configPath
-	panel.GetConfig = func() *config.Config { return cfg }
-	panel.SaveConfig = func(c *config.Config) error { return config.Save(*configPath, c) }
-	panel.Checker = checker
-	panel.Manager = manager
-	panel.Logs = logs
-	panel.Logger = logger
-	panel.OnLiveConfigChange = func(c *config.Config) {
-		manager.SetMode(c.Warp.ReconnectMode)
-		manager.SetIPv6Preference(c.Warp.IPv6Preference)
-		applyLimiter(c, checker)
-	}
-	panel.Scanner = func(ctx context.Context, c *config.Config) ([]cleanip.Result, error) {
-		// MASQUE binds a registration to its home edge: scan the home
-		// edge's service ports instead of random Cloudflare addresses.
-		var results []cleanip.Result
-		var err error
-		if host, ports, ok := manager.HomeEdge(); ok {
-			timeout := 2 * time.Second
-			if d, perr := config.ParseDuration(c.CleanIP.Timeout); perr == nil {
-				timeout = d
-			}
-			results = cleanip.ScanHostPorts(ctx, host, ports, timeout, c.CleanIP.Top)
-		} else {
-			results, err = web.RunScan(ctx, c)
-		}
-		if err == nil {
-			selector.SetPool(results)
-		}
-		return results, err
-	}
-	panel.EndpointApplier = func(ctx context.Context, endpoint string) error {
-		if dec := checker.AllowReconnect(); !dec.Allowed {
-			return fmt.Errorf("rate limited: %s", dec)
-		}
-		err := manager.SetEndpoint(ctx, endpoint)
-		checker.RecordReconnect(err == nil)
-		return err
-	}
-
-	// Listeners: each failure is fatal and logged.
-	lnPanel, err := net.Listen("tcp", cfg.Panel.Listen)
-	if err != nil {
-		logger.Error("panel listen failed", "addr", cfg.Panel.Listen, "err", err)
-		os.Exit(1)
-	}
-	lnHTTP, err := net.Listen("tcp", cfg.HTTPProxy.Listen)
-	if err != nil {
-		logger.Error("http proxy listen failed", "addr", cfg.HTTPProxy.Listen, "err", err)
-		os.Exit(1)
-	}
-	lnSOCKS, err := net.Listen("tcp", cfg.SOCKS.Listen)
-	if err != nil {
-		logger.Error("socks listen failed", "addr", cfg.SOCKS.Listen, "err", err)
-		os.Exit(1)
-	}
-
+	lnPanel, lnHTTP, lnSOCKS := listenAll(cfg, logger)
 	errCh := make(chan error, 4)
-	go func() { errCh <- http.Serve(lnPanel, panel.Handler()) }()
-	go func() { errCh <- httpSrv.Serve(lnHTTP) }()
-	go func() { errCh <- socksSrv.Serve(lnSOCKS) }()
+	// Long-lived panel, proxy and tunnel connections: read/write timeouts
+	// would kill idle streams, so http.Serve's lack of them is intentional.
+	go func() { errCh <- http.Serve(lnPanel, panel.Handler()) }() // #nosec G114
+	go func() {
+		errCh <- (&proxy.HTTPServer{Upstream: upstream, Log: logger, OnRequest: logSink.request}).Serve(lnHTTP)
+	}()
+	go func() { errCh <- (&proxy.SOCKSServer{Upstream: upstream}).Serve(lnSOCKS) }()
 
 	if cfg.Bridge.Enabled {
 		startBridge(errCh, cfg, checker, checkerUpstream, pool, logs, logger)
@@ -193,6 +120,97 @@ func main() {
 	case err := <-errCh:
 		logger.Error("server failed", "err", err)
 	}
+}
+
+// buildUpstream wires the shared proxy upstream with front rewriting: the
+// pool is fed by the Clean-IP scan and decisions read the live config on
+// every request.
+func buildUpstream(cfg *config.Config, manager *warp.Manager) (*proxy.Upstream, *front.Selector) {
+	upstream := &proxy.Upstream{DialFunc: manager.Dial, Resolve: manager.ResolveIP}
+	selector := front.NewSelector(func() front.Config {
+		ttl, err := config.ParseDuration(cfg.Front.ResolveCacheTTL)
+		if err != nil {
+			ttl = 10 * time.Minute
+		}
+		return front.Config{
+			Enabled:         cfg.Front.Enabled,
+			Domains:         cfg.Front.Domains,
+			ResolveCacheTTL: ttl,
+		}
+	})
+	upstream.Front = selector.Pick
+	return upstream, selector
+}
+
+// buildPanel wires the admin panel to the manager, checker, log buffer and
+// the public proxy pool.
+func buildPanel(cfg *config.Config, manager *warp.Manager, checker *health.Checker,
+	logs *logbuf.Buffer, logger *slog.Logger, pool *publicproxy.Pool,
+	panelScan chan struct{}, selector *front.Selector, configPath string) *web.Server {
+	panel := web.New()
+	panel.PublicPool = pool
+	panel.PublicScan = panelScan
+	panel.ConfigPath = configPath
+	panel.GetConfig = func() *config.Config { return cfg }
+	panel.SaveConfig = func(c *config.Config) error { return config.Save(configPath, c) }
+	panel.Checker = checker
+	panel.Manager = manager
+	panel.Logs = logs
+	panel.Logger = logger
+	panel.OnLiveConfigChange = func(c *config.Config) {
+		manager.SetMode(c.Warp.ReconnectMode)
+		manager.SetIPv6Preference(c.Warp.IPv6Preference)
+		applyLimiter(c, checker)
+	}
+	panel.Scanner = func(ctx context.Context, c *config.Config) ([]cleanip.Result, error) {
+		return runCleanIPScan(ctx, c, manager, selector)
+	}
+	panel.EndpointApplier = func(ctx context.Context, endpoint string) error {
+		if dec := checker.AllowReconnect(); !dec.Allowed {
+			return fmt.Errorf("rate limited: %s", dec)
+		}
+		err := manager.SetEndpoint(ctx, endpoint)
+		checker.RecordReconnect(err == nil)
+		return err
+	}
+	return panel
+}
+
+// runCleanIPScan scans the registration's home edge when one is known
+// (MASQUE binds CONNECT-IP auth to it) and falls back to the generic
+// scan otherwise. A successful scan feeds the front pool.
+func runCleanIPScan(ctx context.Context, cfg *config.Config,
+	manager *warp.Manager, selector *front.Selector) ([]cleanip.Result, error) {
+	var results []cleanip.Result
+	var err error
+	if host, ports, ok := manager.HomeEdge(); ok {
+		timeout := 2 * time.Second
+		if d, perr := config.ParseDuration(cfg.CleanIP.Timeout); perr == nil {
+			timeout = d
+		}
+		results = cleanip.ScanHostPorts(ctx, host, ports, timeout, cfg.CleanIP.Top)
+	} else {
+		results, err = web.RunScan(ctx, cfg)
+	}
+	if err == nil {
+		selector.SetPool(results)
+	}
+	return results, err
+}
+
+// listenAll opens the three listener sockets; each failure is fatal.
+func listenAll(cfg *config.Config, logger *slog.Logger) (panel, httpLn, socks net.Listener) {
+	open := func(name, addr string) net.Listener {
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			logger.Error(name+" listen failed", "addr", addr, "err", err)
+			os.Exit(1)
+		}
+		return ln
+	}
+	return open("panel", cfg.Panel.Listen),
+		open("http proxy", cfg.HTTPProxy.Listen),
+		open("socks", cfg.SOCKS.Listen)
 }
 
 // ensurePassword sets the panel password from WARP_PROXY_PASSWORD on first
@@ -274,7 +292,8 @@ func startBridge(errCh chan error, cfg *config.Config, checker *health.Checker,
 		logger.Error("bridge listen failed", "addr", cfg.Bridge.Listen, "err", err)
 		os.Exit(1)
 	}
-	go func() { errCh <- http.Serve(ln, srv) }()
+	// See the panel listener: streaming upstreams need no read timeout.
+	go func() { errCh <- http.Serve(ln, srv) }() // #nosec G114
 }
 
 // refreshBridgeUserAgent discovers the current opencode release from the

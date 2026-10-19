@@ -86,7 +86,7 @@ func DiscoverUserAgent(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // read failure surfaces below
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("npm registry status %d", resp.StatusCode)
 	}
@@ -210,6 +210,26 @@ func ensureTools(body []byte) []byte {
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return body
 	}
+	tools := addMissingStubs(obj)
+	if tools == nil {
+		return body
+	}
+	encoded, err := json.Marshal(tools)
+	if err != nil {
+		return body
+	}
+	obj["tools"] = encoded
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// addMissingStubs appends the stub tools the body lacks and returns the new
+// tool list; nil when every stub is already present or the tools field is
+// unreadable.
+func addMissingStubs(obj map[string]json.RawMessage) []json.RawMessage {
 	var tools []json.RawMessage
 	if raw, ok := obj["tools"]; ok {
 		_ = json.Unmarshal(raw, &tools)
@@ -230,18 +250,9 @@ func ensureTools(body []byte) []byte {
 		added = true
 	}
 	if !added {
-		return body
+		return nil
 	}
-	encoded, err := json.Marshal(tools)
-	if err != nil {
-		return body
-	}
-	obj["tools"] = encoded
-	out, err := json.Marshal(obj)
-	if err != nil {
-		return body
-	}
-	return out
+	return tools
 }
 
 // toolName reads the function name from one OpenAI tool definition.

@@ -51,7 +51,7 @@ func (p *Pool) Pick() (Entry, bool) {
 	if len(p.entries) == 0 {
 		return Entry{}, false
 	}
-	i := int(p.next.Add(1)-1) % len(p.entries)
+	i := int(p.next.Add(1)-1) % len(p.entries) // #nosec G115 -- 64-bit counter, overflow unreachable
 	return p.entries[i], true
 }
 

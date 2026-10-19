@@ -44,7 +44,9 @@ func (id *Identity) SaveAt(path string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create state dir: %w", err)
 	}
-	b, err := json.MarshalIndent(id, "", "  ")
+	// The device private key is the identity state file's purpose: it is the
+	// only copy, chmod 0700 dir, never leaves the machine.
+	b, err := json.MarshalIndent(id, "", "  ") // #nosec G117
 	if err != nil {
 		return err
 	}
@@ -52,13 +54,13 @@ func (id *Identity) SaveAt(path string) error {
 	if err != nil {
 		return fmt.Errorf("temp state file: %w", err)
 	}
-	defer os.Remove(tmp.Name())
+	defer os.Remove(tmp.Name()) //nolint:errcheck // no-op after a successful rename
 	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("write state: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("sync state: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
@@ -75,11 +77,12 @@ func LoadIdentity(dir string) (*Identity, error) {
 
 // LoadIdentityAt reads the identity from the given file path.
 func LoadIdentityAt(path string) (*Identity, error) {
-	f, err := os.Open(path)
+	// The path comes from the operator's state_dir, not from request input.
+	f, err := os.Open(path) // #nosec G304
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer f.Close() //nolint:errcheck // decode failure surfaces below
 	var id Identity
 	if err := json.NewDecoder(f).Decode(&id); err != nil {
 		return nil, fmt.Errorf("parse identity state: %w", err)

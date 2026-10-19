@@ -94,10 +94,11 @@ func tunnelTLSConf(id *Identity) (*tls.Config, error) {
 		Certificates: []tls.Certificate{cert},
 		ServerName:   ConnectSNI,
 		// The endpoint is trusted by key pinning, not PKI: the SNI does not
-		// match the endpoint IP.
-		InsecureSkipVerify:    true,
-		VerifyPeerCertificate: pinVerifier(pinned),
-		MinVersion:            tls.VersionTLS13,
+		// match the endpoint IP. VerifyConnection (not VerifyPeerCertificate)
+		// keeps the pin active on resumed sessions too.
+		InsecureSkipVerify: true, // #nosec G402 -- self-signed endpoint, pubkey pin below
+		VerifyConnection:   pinVerifier(pinned),
+		MinVersion:         tls.VersionTLS13,
 	}, nil
 }
 
@@ -147,20 +148,40 @@ func dialH3(ctx context.Context, id *Identity, conf *tls.Config,
 		KeepAlivePeriod:   15 * time.Second,
 		MaxIdleTimeout:    30 * time.Second,
 	}
+	session, teardown, err := dialH3QUIC(ctx, endpoint, tlsConf, quicConf)
+	if err != nil {
+		return nil, err
+	}
+	return newH3Tunnel(ctx, session, teardown)
+}
+
+// h3Session carries the live HTTP/3 connection plus everything its tunnel
+// needs to close.
+type h3Session struct {
+	conn      *quic.Conn
+	transport *http3.Transport
+	teardown  func()
+}
+
+// dialH3QUIC dials the QUIC connection under the endpoint: a pinned UDP
+// socket, a 20-byte connection-ID generator and the http3 client on top.
+// The returned teardown releases every resource it opened.
+func dialH3QUIC(ctx context.Context, endpoint string,
+	tlsConf *tls.Config, quicConf *quic.Config) (*h3Session, func(), error) {
 	// The backend intermittently emits PROTOCOL_VIOLATION unless the client
 	// uses 20-byte source connection IDs, so pin the generator length.
 	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{})
 	if err != nil {
-		return nil, fmt.Errorf("udp socket: %w", err)
+		return nil, nil, fmt.Errorf("udp socket: %w", err)
 	}
 	qTransport := &quic.Transport{
 		Conn:               udpConn,
 		ConnectionIDLength: quicCIDLength,
 	}
-	fail := func(e error) (*Tunnel, error) {
-		qTransport.Close()
-		udpConn.Close()
-		return nil, e
+	fail := func(e error) (*h3Session, func(), error) {
+		_ = qTransport.Close() //nolint:errcheck // best-effort teardown
+		_ = udpConn.Close()    //nolint:errcheck // best-effort teardown
+		return nil, nil, e
 	}
 	addr, err := net.ResolveUDPAddr("udp", endpoint)
 	if err != nil {
@@ -176,42 +197,26 @@ func dialH3(ctx context.Context, id *Identity, conf *tls.Config,
 		EnableDatagrams:    true,
 		AdditionalSettings: map[uint64]uint64{h3SettingDatagram00: 1},
 	}
-	client := transport.NewClientConn(conn)
+	teardown := func() {
+		_ = transport.Close()
+		_ = qTransport.Close()
+		_ = udpConn.Close()
+	}
+	return &h3Session{conn: conn, transport: transport, teardown: teardown}, teardown, nil
+}
+
+// newH3Tunnel opens the extended CONNECT on the live session and returns the
+// datagram tunnel over it.
+func newH3Tunnel(ctx context.Context, s *h3Session,
+	teardown func()) (*Tunnel, error) {
+	client := s.transport.NewClientConn(s.conn)
 
 	// The CONNECT stream is the tunnel's lifetime; its context is decoupled
 	// from the dial context and released by Tunnel.Close.
-	reqCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodConnect, ConnectURI, nil)
+	stream, status, cancel, err := openH3Connect(ctx, client, s.conn)
 	if err != nil {
-		conn.CloseWithError(quic.ApplicationErrorCode(0), "setup failed")
-		cancel()
-		return fail(err)
-	}
-	req.Proto = ConnectProtocol
-	req.Header.Set("Capsule-Protocol", "?1")
-	req.Header.Set("User-Agent", "")
-
-	stream, err := client.OpenRequestStream(reqCtx)
-	if err != nil {
-		conn.CloseWithError(quic.ApplicationErrorCode(0), "setup failed")
-		cancel()
-		return fail(fmt.Errorf("open request stream: %w", err))
-	}
-	if err := stream.SendRequestHeader(req); err != nil {
-		conn.CloseWithError(quic.ApplicationErrorCode(0), "setup failed")
-		cancel()
-		return fail(fmt.Errorf("send extended CONNECT: %w", err))
-	}
-	resp, err := stream.ReadResponse()
-	if err != nil {
-		conn.CloseWithError(quic.ApplicationErrorCode(0), "setup failed")
-		cancel()
-		return fail(fmt.Errorf("read CONNECT response: %w", err))
-	}
-	if resp.StatusCode != http.StatusOK {
-		conn.CloseWithError(quic.ApplicationErrorCode(0), "connect rejected")
-		cancel()
-		return fail(fmt.Errorf("MASQUE CONNECT rejected: %d", resp.StatusCode))
+		teardown()
+		return nil, err
 	}
 	return &Tunnel{
 		send: func(packet []byte) error {
@@ -239,14 +244,47 @@ func dialH3(ctx context.Context, id *Identity, conf *tls.Config,
 			stream.CancelRead(0)
 			stream.CancelWrite(0)
 			_ = client.CloseWithError(0, "closed")
-			_ = conn.CloseWithError(0, "closed")
-			_ = transport.Close()
-			_ = qTransport.Close()
-			_ = udpConn.Close()
+			_ = s.conn.CloseWithError(0, "closed")
+			teardown()
 			return nil
 		},
-		status: resp.StatusCode,
+		status: status,
 	}, nil
+}
+
+// openH3Connect opens the extended CONNECT stream and waits for the
+// response. The returned cancel belongs to the tunnel's lifetime context
+// and must be kept until the stream closes.
+func openH3Connect(ctx context.Context, client *http3.ClientConn,
+	conn *quic.Conn) (stream *http3.RequestStream, status int, cancel context.CancelFunc, err error) {
+	reqCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	bad := func(e error) (*http3.RequestStream, int, context.CancelFunc, error) {
+		_ = conn.CloseWithError(quic.ApplicationErrorCode(0), "setup failed") //nolint:errcheck // best-effort teardown
+		cancel()
+		return nil, 0, nil, e
+	}
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodConnect, ConnectURI, nil)
+	if err != nil {
+		return bad(err)
+	}
+	req.Proto = ConnectProtocol
+	req.Header.Set("Capsule-Protocol", "?1")
+	req.Header.Set("User-Agent", "")
+	stream, err = client.OpenRequestStream(reqCtx)
+	if err != nil {
+		return bad(fmt.Errorf("open request stream: %w", err))
+	}
+	if err := stream.SendRequestHeader(req); err != nil {
+		return bad(fmt.Errorf("send extended CONNECT: %w", err))
+	}
+	resp, err := stream.ReadResponse()
+	if err != nil {
+		return bad(fmt.Errorf("read CONNECT response: %w", err))
+	}
+	if resp.StatusCode != http.StatusOK {
+		return bad(fmt.Errorf("MASQUE CONNECT rejected: %d", resp.StatusCode))
+	}
+	return stream, resp.StatusCode, cancel, nil
 }
 
 // selfSignedCert builds the short-lived self-signed certificate that wraps
@@ -272,19 +310,17 @@ func selfSignedCert(key *ecdsa.PrivateKey) (tls.Certificate, error) {
 	}, nil
 }
 
-// pinVerifier returns the VerifyPeerCertificate callback that accepts the
+// pinVerifier returns the VerifyConnection callback that accepts the
 // endpoint only when its certificate carries the pinned public key. The
 // handshake signature is still verified by the TLS stack, so a MITM without
-// the pinned private key cannot complete it.
-func pinVerifier(pinned *ecdsa.PublicKey) func([][]byte, [][]*x509.Certificate) error {
-	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-		if len(rawCerts) == 0 {
+// the pinned private key cannot complete it. VerifyConnection runs on
+// resumed sessions too, unlike VerifyPeerCertificate.
+func pinVerifier(pinned *ecdsa.PublicKey) func(tls.ConnectionState) error {
+	return func(cs tls.ConnectionState) error {
+		if len(cs.PeerCertificates) == 0 {
 			return errors.New("endpoint sent no certificate")
 		}
-		leaf, err := x509.ParseCertificate(rawCerts[0])
-		if err != nil {
-			return fmt.Errorf("parse server certificate: %w", err)
-		}
+		leaf := cs.PeerCertificates[0]
 		got, ok := leaf.PublicKey.(*ecdsa.PublicKey)
 		if !ok || !got.Equal(pinned) {
 			return errors.New("endpoint public key mismatch (pin failed)")

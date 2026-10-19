@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	"warp-proxy/internal/config"
 )
 
 // The Anthropic-compatible surface: POST /v1/messages speaks the Anthropic
@@ -21,23 +23,9 @@ const chatCompletionsPath = "/v1/chat/completions"
 // serveMessages handles one /v1/messages request end to end.
 func (s *Server) serveMessages(w http.ResponseWriter, r *http.Request) {
 	cfg := s.Cfg()
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
-	if err != nil {
-		anthropicError(w, http.StatusBadRequest, "read request body failed")
+	openaiBody, ids, clientStream, ok := s.prepareMessages(w, r, cfg)
+	if !ok {
 		return
-	}
-	if len(body) > maxBody {
-		anthropicError(w, http.StatusRequestEntityTooLarge, "request body exceeds bridge limit")
-		return
-	}
-	openaiBody, clientStream, cerr := anthropicToOpenAI(body)
-	if cerr != nil {
-		anthropicError(w, http.StatusBadRequest, cerr.Error())
-		return
-	}
-	ids := newIdentity(cfg)
-	if ids != nil {
-		openaiBody = forceStream(ensureTools(openaiBody))
 	}
 
 	if err := s.acquire(r.Context(), cfg); err != nil {
@@ -58,7 +46,7 @@ func (s *Server) serveMessages(w http.ResponseWriter, r *http.Request) {
 		anthropicError(w, http.StatusBadGateway, "bridge upstream failed: "+replayErr.Error())
 		return
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // status handled below
 	if resp.StatusCode != http.StatusOK {
 		writeAnthropicUpstreamError(w, resp)
 		return
@@ -75,13 +63,39 @@ func (s *Server) serveMessages(w http.ResponseWriter, r *http.Request) {
 	writeAnthropicMessage(w, agg)
 }
 
+// prepareMessages reads the request body, translates it to the OpenAI shape
+// and injects the free-tier identity. It writes the error response itself and
+// reports ok=false when the request cannot proceed.
+func (s *Server) prepareMessages(w http.ResponseWriter, r *http.Request,
+	cfg config.BridgeConfig) ([]byte, *identity, bool, bool) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
+	if err != nil {
+		anthropicError(w, http.StatusBadRequest, "read request body failed")
+		return nil, nil, false, false
+	}
+	if len(body) > maxBody {
+		anthropicError(w, http.StatusRequestEntityTooLarge, "request body exceeds bridge limit")
+		return nil, nil, false, false
+	}
+	openaiBody, clientStream, cerr := anthropicToOpenAI(body)
+	if cerr != nil {
+		anthropicError(w, http.StatusBadRequest, cerr.Error())
+		return nil, nil, false, false
+	}
+	ids := newIdentity(cfg)
+	if ids != nil {
+		openaiBody = forceStream(ensureTools(openaiBody))
+	}
+	return openaiBody, ids, clientStream, true
+}
+
 // collectCompletion drains an SSE stream into an aggregated completion; a
 // non-stream response is passed through by parsing its JSON body.
 func (s *Server) collectCompletion(resp *http.Response) (aggregated, error) {
 	if isSSE(resp) {
-		agg := aggregateSSE(resp.Body)
-		resp.Body.Close()
-		return agg, nil
+		agg, aerr := aggregateSSE(resp.Body)
+		_ = resp.Body.Close()
+		return agg, aerr
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
 	if err != nil {
@@ -211,7 +225,8 @@ func writeAnthropicStream(w http.ResponseWriter, agg aggregated) {
 	w.WriteHeader(http.StatusOK)
 	send := func(event string, data map[string]any) {
 		b, _ := json.Marshal(data)
-		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
+		// A broken stream surfaces on the next Flush, not here.
+		_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
 	}
 	flusher, _ := w.(http.Flusher)
 	send("message_start", map[string]any{
@@ -248,9 +263,10 @@ func writeAnthropicStream(w http.ResponseWriter, agg aggregated) {
 // anthropicError answers with the Anthropic error envelope.
 func anthropicError(w http.ResponseWriter, status int, message string) {
 	errType := "upstream_error"
-	if status == http.StatusBadRequest {
+	switch status {
+	case http.StatusBadRequest:
 		errType = "invalid_request_error"
-	} else if status == http.StatusTooManyRequests {
+	case http.StatusTooManyRequests:
 		errType = "rate_limit_error"
 	}
 	w.Header().Set("Content-Type", "application/json")

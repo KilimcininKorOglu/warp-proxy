@@ -102,7 +102,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveModels(w, r)
 		return
 	}
+	s.serveChat(w, r)
+}
 
+// serveChat runs the OpenAI chat pipeline: buffer, inject the free-tier
+// identity, replay with rotation, and reassemble SSE for JSON callers.
+func (s *Server) serveChat(w http.ResponseWriter, r *http.Request) {
 	cfg := s.Cfg()
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
@@ -134,26 +139,41 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer s.release()
 
 	resp, replayErr := s.replay(r, body, cfg, ids)
-	if errors.Is(replayErr, errClientCanceled) {
-		http.Error(w, "client canceled while waiting for retry", http.StatusBadGateway)
-		return
-	}
 	if replayErr != nil {
-		http.Error(w, "bridge upstream failed: "+replayErr.Error(), http.StatusBadGateway)
+		s.writeReplayError(w, replayErr)
 		return
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // copy failure surfaces to the client
 
 	if ids != nil && !clientStream && isSSE(resp) {
-		agg := aggregateSSE(resp.Body)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(agg.openaiCompletion())
-		s.note("info", "%s %s -> 200 (aggregated)", r.Method, r.URL.Path)
+		s.writeAggregated(w, r, resp)
 		return
 	}
 	copyResponse(w, resp)
 	s.note("info", "%s %s -> %d", r.Method, r.URL.Path, resp.StatusCode)
+}
+
+// writeReplayError maps a replay failure onto the client response.
+func (s *Server) writeReplayError(w http.ResponseWriter, replayErr error) {
+	if errors.Is(replayErr, errClientCanceled) {
+		http.Error(w, "client canceled while waiting for retry", http.StatusBadGateway)
+		return
+	}
+	http.Error(w, "bridge upstream failed: "+replayErr.Error(), http.StatusBadGateway)
+}
+
+// writeAggregated reassembles an SSE upstream stream into one JSON response
+// for callers that did not ask to stream.
+func (s *Server) writeAggregated(w http.ResponseWriter, r *http.Request, resp *http.Response) {
+	agg, aerr := aggregateSSE(resp.Body)
+	if aerr != nil {
+		http.Error(w, "read upstream stream: "+aerr.Error(), http.StatusBadGateway)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(agg.openaiCompletion())
+	s.note("info", "%s %s -> 200 (aggregated)", r.Method, r.URL.Path)
 }
 
 // replay runs the request against the upstream, retrying up to
@@ -168,7 +188,7 @@ func (s *Server) replay(r *http.Request, body []byte,
 		if err != nil || !retryable(cfg, resp.StatusCode) || attempt == attempts {
 			if err == nil && retryable(cfg, resp.StatusCode) {
 				if fb := s.fallback(r, body, cfg, ids); fb != nil {
-					resp.Body.Close()
+					_ = resp.Body.Close()
 					return fb, nil
 				}
 			}
@@ -219,12 +239,12 @@ func (s *Server) prepareReplay(r *http.Request, resp *http.Response,
 	if wait > 0 {
 		select {
 		case <-r.Context().Done():
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			return errClientCanceled
 		case <-time.After(wait):
 		}
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	return nil
 }
 
@@ -233,7 +253,7 @@ func (s *Server) prepareReplay(r *http.Request, resp *http.Response,
 func (s *Server) rotateForReplay(r *http.Request, resp *http.Response,
 	cfg config.BridgeConfig, ids *identity) error {
 	s.note("warn", "free-tier quota on %s, rotating WARP for replay", r.URL.Path)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if err := s.Rotate(r.Context()); err != nil {
 		s.note("warn", "rotation before replay failed: %v", err)
 		return err
@@ -254,7 +274,7 @@ func isUsageLimitError(resp *http.Response) bool {
 		return false
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorPeek))
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 	if err != nil {
 		return false
@@ -286,7 +306,9 @@ func (s *Server) roundTripVia(r *http.Request, body []byte, cfg config.BridgeCon
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}
-	req, err := http.NewRequestWithContext(ctx, r.Method, target, bytes.NewReader(body))
+	// The upstream base URL is operator config and the path is forwarded by
+	// design; this is a reverse proxy, not a URL filter.
+	req, err := http.NewRequestWithContext(ctx, r.Method, target, bytes.NewReader(body)) // #nosec G704
 	if err != nil {
 		return nil, err
 	}
@@ -310,7 +332,12 @@ func (s *Server) acquire(ctx context.Context, cfg config.BridgeConfig) error {
 			return ctx.Err()
 		}
 	}
-	minGap := cfg.MinIntervalDur()
+	return s.awaitSpacing(ctx, cfg.MinIntervalDur())
+}
+
+// awaitSpacing blocks until minGap has passed since the last upstream call,
+// or the context ends.
+func (s *Server) awaitSpacing(ctx context.Context, minGap time.Duration) error {
 	if minGap <= 0 {
 		return nil
 	}
@@ -404,5 +431,5 @@ func copyResponse(w http.ResponseWriter, resp *http.Response) {
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	_, _ = io.Copy(w, resp.Body)
 }

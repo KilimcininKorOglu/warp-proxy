@@ -51,7 +51,7 @@ func FetchRanges(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("fetch ranges: %w", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // read failure surfaces below
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("fetch ranges: status %s", resp.Status)
 	}
@@ -120,7 +120,7 @@ func Probe(ctx context.Context, ip string, port int, timeout time.Duration) (tim
 		return 0, err
 	}
 	latency := time.Since(start)
-	conn.Close()
+	_ = conn.Close() // probe result is the latency, close error is irrelevant
 	return latency, nil
 }
 

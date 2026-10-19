@@ -54,12 +54,12 @@ func liveTLSConf(t *testing.T, id *Identity) *tls.Config {
 		t.Fatalf("pinned key: %v", err)
 	}
 	return &tls.Config{
-		Certificates:          []tls.Certificate{cert},
-		ServerName:            ConnectSNI,
-		NextProtos:            []string{"h3"},
-		InsecureSkipVerify:    true,
-		VerifyPeerCertificate: pinVerifier(pinned),
-		MinVersion:            tls.VersionTLS13,
+		Certificates:       []tls.Certificate{cert},
+		ServerName:         ConnectSNI,
+		NextProtos:         []string{"h3"},
+		InsecureSkipVerify: true,
+		VerifyConnection:   pinVerifier(pinned),
+		MinVersion:         tls.VersionTLS13,
 	}
 }
 
@@ -79,7 +79,7 @@ func TestLiveQuicHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handshake failed: %v", err)
 	}
-	defer conn.CloseWithError(0, "")
+	defer conn.CloseWithError(0, "") //nolint:errcheck // test teardown
 	t.Logf("handshake OK: tls=0x%x", conn.ConnectionState().TLS.Version)
 }
 
@@ -97,7 +97,7 @@ func TestLiveEndpointScan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tcp tls dial failed: %v", err)
 	}
-	defer nc.Close()
+	defer nc.Close() //nolint:errcheck // test teardown
 	tc := nc.(*tls.Conn)
 	st := tc.ConnectionState()
 	t.Logf("tcp+tls handshake OK: tls=0x%x alpn=%q", st.Version, st.NegotiatedProtocol)
@@ -114,7 +114,7 @@ func TestLiveNetstack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tunnel: %v", err)
 	}
-	defer tun.Close()
+	defer tun.Close() //nolint:errcheck // test teardown
 	d, err := NewNetstackDialer(tun, id)
 	if err != nil {
 		t.Fatalf("netstack: %v", err)
@@ -128,7 +128,7 @@ func TestLiveNetstack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer conn.Close() //nolint:errcheck // test teardown
 	req := "GET / HTTP/1.1\r\nHost: cloudflare.com\r\nConnection: close\r\n\r\n"
 	if _, err := conn.Write([]byte(req)); err != nil {
 		t.Fatalf("write: %v", err)
@@ -145,13 +145,6 @@ func TestLiveNetstack(t *testing.T) {
 	}
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 // TestLiveIdleSurvival keeps the tunnel idle past the negotiated idle
 // timeout and then dials again: keep-alive must keep it usable.
 func TestLiveIdleSurvival(t *testing.T) {
@@ -163,7 +156,7 @@ func TestLiveIdleSurvival(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tunnel: %v", err)
 	}
-	defer tun.Close()
+	defer tun.Close() //nolint:errcheck // test teardown
 	d, err := NewNetstackDialer(tun, id)
 	if err != nil {
 		t.Fatalf("netstack: %v", err)
@@ -172,14 +165,14 @@ func TestLiveIdleSurvival(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial before idle: %v", err)
 	}
-	conn.Close()
+	_ = conn.Close()
 	t.Log("idle 60s starting")
 	time.Sleep(60 * time.Second)
 	conn2, err := d.Dial(ctx, "tcp", "cloudflare.com:80")
 	if err != nil {
 		t.Fatalf("dial after idle: %v", err)
 	}
-	conn2.Close()
+	_ = conn2.Close()
 	t.Log("tunnel survived idle and dialed again")
 }
 
@@ -198,14 +191,14 @@ func TestLiveAppFlow(t *testing.T) {
 		}
 		d, err := NewNetstackDialer(tun, id)
 		if err != nil {
-			tun.Close()
+			_ = tun.Close()
 			cancel()
 			t.Fatalf("round %d: netstack: %v", round, err)
 		}
 		time.Sleep(15 * time.Second)
 		conn, err := d.Dial(ctx, "tcp", "www.cloudflare.com:443")
 		if err != nil {
-			tun.Close()
+			_ = tun.Close()
 			cancel()
 			t.Fatalf("round %d: dial: %v", round, err)
 		}
@@ -213,12 +206,12 @@ func TestLiveAppFlow(t *testing.T) {
 		buf := make([]byte, 64)
 		_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 		if _, err := conn.Write([]byte("GET /cdn-cgi/trace HTTP/1.1\r\nHost: www.cloudflare.com\r\nConnection: close\r\n\r\n")); err != nil {
-			tun.Close()
+			_ = tun.Close()
 			cancel()
 			t.Fatalf("round %d: write: %v", round, err)
 		}
 		n, err := conn.Read(buf)
-		tun.Close()
+		_ = tun.Close()
 		cancel()
 		if err != nil && n == 0 {
 			t.Fatalf("round %d: read: %v", round, err)
@@ -237,7 +230,7 @@ func egressFor(t *testing.T, ctx context.Context, id *Identity,
 	if err != nil {
 		return "", fmt.Errorf("tunnel: %w", err)
 	}
-	defer tun.Close()
+	defer tun.Close() //nolint:errcheck // helper teardown, error carried above
 	d, err := NewNetstackDialer(tun, id)
 	if err != nil {
 		return "", fmt.Errorf("netstack: %w", err)
@@ -316,34 +309,34 @@ func TestLiveEgressPerEndpoint(t *testing.T) {
 		}
 		d, derr := NewNetstackDialer(tun, id)
 		if derr != nil {
-			tun.Close()
+			_ = tun.Close()
 			cancel()
 			continue
 		}
 		conn, cerr := d.Dial(ctx, "tcp", "1.1.1.1:53")
 		if cerr != nil {
-			tun.Close()
+			_ = tun.Close()
 			cancel()
 			t.Logf("endpoint %q: dial: %v", ep, cerr)
 			continue
 		}
-		conn.Close()
+		_ = conn.Close()
 		// UDP DNS via netstack for whoami TXT.
 		resp, rerr := d.dnsExchange(ctx, BuildTXTQuery("whoami.cloudflare"))
 		if rerr != nil {
 			t.Logf("endpoint %q: dns: %v", ep, rerr)
-			tun.Close()
+			_ = tun.Close()
 			cancel()
 			continue
 		}
 		txt, terr := parseTXTFromMessage(resp)
 		if terr != nil {
 			t.Logf("endpoint %q: parse: %v", ep, terr)
-			tun.Close()
+			_ = tun.Close()
 			cancel()
 			continue
 		}
-		tun.Close()
+		_ = tun.Close()
 		cancel()
 		t.Logf("endpoint %q -> egress %q", ep, txt)
 	}
@@ -361,7 +354,7 @@ func TestLiveIPv6Egress(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tunnel: %v", err)
 	}
-	defer tun.Close()
+	defer tun.Close() //nolint:errcheck // test teardown
 	d, err := NewNetstackDialer(tun, id)
 	if err != nil {
 		t.Fatalf("netstack: %v", err)
@@ -370,7 +363,7 @@ func TestLiveIPv6Egress(t *testing.T) {
 	if err != nil {
 		t.Fatalf("v6 dial: %v", err)
 	}
-	defer conn.Close()
+	defer conn.Close() //nolint:errcheck // test teardown
 	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if _, err := conn.Write([]byte("GET /cdn-cgi/trace HTTP/1.1\r\nHost: www.cloudflare.com\r\nConnection: close\r\n\r\n")); err != nil {
 		t.Fatalf("write: %v", err)
@@ -383,7 +376,7 @@ func TestLiveIPv6Egress(t *testing.T) {
 	}
 	body := string(buf[:n])
 	line := ""
-	for _, l := range strings.Split(body, "\n") {
+	for l := range strings.SplitSeq(body, "\n") {
 		if strings.HasPrefix(l, "ip=") {
 			line = strings.TrimSpace(l)
 		}
@@ -402,7 +395,7 @@ func TestLiveEgressAcrossFreshRegistrations(t *testing.T) {
 	liveGuard(t)
 	const n = 5
 	client := NewClient()
-	for i := 0; i < n; i++ {
+	for i := range n {
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		id, err := RegisterAuto(ctx, Options{Name: "warp-proxy-colo-probe"})
 		if err != nil {
@@ -455,7 +448,7 @@ func TestLiveSimultaneousEgress(t *testing.T) {
 			t.Logf("%s: tunnel: %v", names[i], err)
 			continue
 		}
-		defer tun.Close()
+		defer tun.Close() //nolint:errcheck // test teardown
 		d, err := NewNetstackDialer(tun, id)
 		if err != nil {
 			continue

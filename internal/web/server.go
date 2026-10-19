@@ -90,7 +90,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /cleanip/apply", s.requireAuth(s.doCleanIPApply))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintln(w, "ok")
+		_, _ = fmt.Fprintln(w, "ok")
 	})
 	return mux
 }
@@ -139,7 +139,10 @@ func (s *Server) startSession(w http.ResponseWriter) {
 	s.sessions[token] = now.Add(sessionTTL)
 	s.mu.Unlock()
 
-	http.SetCookie(w, &http.Cookie{
+	// The panel is served over plain HTTP by design (LAN/VPS listener), so
+	// Secure cannot be set without breaking every login; HttpOnly and
+	// SameSite=Lax are present.
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- HTTP-only panel, see above
 		Name:     "warp_proxy_session",
 		Value:    token,
 		Path:     "/",
@@ -180,7 +183,7 @@ func (s *Server) doLogout(w http.ResponseWriter, r *http.Request) {
 		delete(s.sessions, c.Value)
 		s.mu.Unlock()
 	}
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- HTTP-only panel, see startSession
 		Name: "warp_proxy_session", Value: "", Path: "/",
 		MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteLaxMode,
 	})
@@ -272,10 +275,7 @@ func applyForm(cfg *config.Config, r *http.Request) {
 	cfg.Panel.Listen = formOr(r, "panel_listen", cfg.Panel.Listen)
 	cfg.HTTPProxy.Listen = formOr(r, "http_listen", cfg.HTTPProxy.Listen)
 	cfg.SOCKS.Listen = formOr(r, "socks_listen", cfg.SOCKS.Listen)
-	cfg.Warp.Accounts = formIntOr(r, "warp_accounts", cfg.Warp.Accounts)
-	if cfg.Warp.Accounts < 1 {
-		cfg.Warp.Accounts = 1
-	}
+	cfg.Warp.Accounts = max(formIntOr(r, "warp_accounts", cfg.Warp.Accounts), 1)
 	cfg.Warp.ReconnectMode = r.FormValue("reconnect_mode")
 	if cfg.Warp.ReconnectMode != warp.ModeReregister {
 		cfg.Warp.ReconnectMode = warp.ModeReconnect

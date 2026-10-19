@@ -74,7 +74,7 @@ func fetchOne(ctx context.Context, client *http.Client, src string) (string, err
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // read failure surfaces below
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return "", fmt.Errorf("status %d", resp.StatusCode)
 	}
@@ -90,40 +90,60 @@ func fetchOne(ctx context.Context, client *http.Client, src string) (string, err
 // and blanks return false.
 func parseProxyLine(line string) (Candidate, bool) {
 	line = strings.TrimSpace(line)
-	if line == "" || strings.HasPrefix(line, "#") {
+	if line == "" || strings.HasPrefix(line, "#") ||
+		strings.ContainsAny(line, " \t") {
 		return Candidate{}, false
 	}
-	if strings.ContainsRune(line, ' ') || strings.ContainsRune(line, '\t') {
+	scheme, rest := splitScheme(line)
+	if !supportedSchemes[scheme] {
 		return Candidate{}, false
 	}
-	c := Candidate{Scheme: "http"}
-	if i := strings.Index(line, "://"); i >= 0 {
-		c.Scheme = strings.ToLower(line[:i])
-		line = line[i+3:]
-	}
-	if !supportedSchemes[c.Scheme] {
+	user, pass, rest, ok := splitUserPass(rest)
+	if !ok {
 		return Candidate{}, false
 	}
-	if i := strings.Index(line, "@"); i >= 0 {
-		cred := line[:i]
-		line = line[i+1:]
-		user, pass, ok := strings.Cut(cred, ":")
-		if !ok {
-			return Candidate{}, false
-		}
-		c.Username, c.Password = user, pass
+	host, port, ok := splitHostPort(rest)
+	if !ok {
+		return Candidate{}, false
 	}
-	host, portStr, err := net.SplitHostPort(line)
+	return Candidate{Scheme: scheme, Host: host, Port: port, Username: user,
+		Password: pass}, true
+}
+
+// splitScheme splits an optional leading "scheme://" and lowercases it,
+// defaulting to http. rest is everything after "://".
+func splitScheme(line string) (scheme, rest string) {
+	if before, after, ok := strings.Cut(line, "://"); ok {
+		return strings.ToLower(before), after
+	}
+	return "http", line
+}
+
+// splitUserPass splits an optional "user:pass@" prefix.
+func splitUserPass(rest string) (user, pass, addr string, ok bool) {
+	before, after, ok := strings.Cut(rest, "@")
+	if !ok {
+		return "", "", rest, true
+	}
+	user, pass, found := strings.Cut(before, ":")
+	if !found {
+		return "", "", "", false
+	}
+	return user, pass, after, true
+}
+
+// splitHostPort validates and splits "host:port" into its parts.
+func splitHostPort(addr string) (host string, port int, ok bool) {
+	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
-		return Candidate{}, false
+		return "", 0, false
 	}
-	port, err := strconv.Atoi(portStr)
+	port, err = strconv.Atoi(portStr)
 	if err != nil || port < 1 || port > 65535 || host == "" ||
 		strings.ContainsAny(host, "/?") {
-		return Candidate{}, false
+		return "", 0, false
 	}
-	c.Host, c.Port = host, port
-	return c, true
+	return host, port, true
 }
 
 // parseProxyURL builds the *url.URL the stdlib transport needs.

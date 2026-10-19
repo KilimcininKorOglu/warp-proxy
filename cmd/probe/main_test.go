@@ -29,19 +29,19 @@ func TestBuildAndParseDNSRoundtrip(t *testing.T) {
 	txt := []byte("ip=104.28.240.1")
 	resp := &bytes.Buffer{}
 	resp.Write([]byte{0x2b, 0x1f, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0})
-	for _, label := range strings.Split("whoami.cloudflare", ".") {
+	for label := range strings.SplitSeq("whoami.cloudflare", ".") {
 		resp.WriteByte(byte(len(label)))
 		resp.WriteString(label)
 	}
 	resp.WriteByte(0)
-	binary.Write(resp, binary.BigEndian, uint16(16)) // qtype
-	binary.Write(resp, binary.BigEndian, uint16(1))  // qclass
+	_ = binary.Write(resp, binary.BigEndian, uint16(16)) // qtype
+	_ = binary.Write(resp, binary.BigEndian, uint16(1))  // qclass
 	// Answer: name pointer, TXT, class IN, ttl, rdlength, string.
-	binary.Write(resp, binary.BigEndian, uint16(0xc00c))
-	binary.Write(resp, binary.BigEndian, uint16(16))
-	binary.Write(resp, binary.BigEndian, uint16(1))
-	binary.Write(resp, binary.BigEndian, uint32(300))
-	binary.Write(resp, binary.BigEndian, uint16(len(txt)+1))
+	_ = binary.Write(resp, binary.BigEndian, uint16(0xc00c))
+	_ = binary.Write(resp, binary.BigEndian, uint16(16))
+	_ = binary.Write(resp, binary.BigEndian, uint16(1))
+	_ = binary.Write(resp, binary.BigEndian, uint32(300))
+	_ = binary.Write(resp, binary.BigEndian, uint16(len(txt)+1))
 	resp.WriteByte(byte(len(txt)))
 	resp.Write(txt)
 

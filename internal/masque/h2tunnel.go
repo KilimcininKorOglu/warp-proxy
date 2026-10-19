@@ -41,6 +41,10 @@ const http2DefaultWindowSize = 65535
 // h2StreamID is the single CONNECT stream of the tunnel.
 const h2StreamID = 1
 
+// maxCapsuleLen bounds a capsule's declared length so a hostile peer cannot
+// make the session preallocate unbounded memory. IP packets stay far below.
+const maxCapsuleLen = 1 << 20
+
 // dialH2 establishes the MASQUE session over the HTTP/2 fallback: TCP+TLS to
 // the H2 endpoint, then a plain CONNECT carrying the cf-connect-proto header.
 // The endpoint never advertises ENABLE_CONNECT_PROTOCOL, so a stock HTTP/2
@@ -58,12 +62,12 @@ func dialH2(ctx context.Context, id *Identity, conf *tls.Config) (*Tunnel, error
 	tlsConf.NextProtos = []string{"h2"}
 	tc := tls.Client(raw, tlsConf)
 	if err := tc.HandshakeContext(ctx); err != nil {
-		raw.Close()
+		_ = raw.Close()
 		return nil, fmt.Errorf("tls handshake %s: %w", addr, err)
 	}
 	sess, err := newH2Session(tc)
 	if err != nil {
-		raw.Close()
+		_ = raw.Close()
 		return nil, fmt.Errorf("h2 session: %w", err)
 	}
 	sess.wg.Add(1)
@@ -71,7 +75,7 @@ func dialH2(ctx context.Context, id *Identity, conf *tls.Config) (*Tunnel, error
 
 	status, err := sess.connect(ctx)
 	if err != nil {
-		sess.close()
+		_ = sess.close()
 		return nil, err
 	}
 	return &Tunnel{
@@ -86,7 +90,6 @@ func dialH2(ctx context.Context, id *Identity, conf *tls.Config) (*Tunnel, error
 type h2Session struct {
 	conn *tls.Conn
 	fr   *http2.Framer
-	enc  *hpack.Encoder
 	dec  *hpack.Decoder
 
 	// outbound flow control: bytes the peer's window still allows.
@@ -171,65 +174,89 @@ func (s *h2Session) readLoop() {
 			return
 		}
 		h2Debug("read frame: %T %v", f, f.Header())
-		switch f := f.(type) {
-		case *http2.SettingsFrame:
-			if f.IsAck() {
-				continue
-			}
-			_ = f.ForeachSetting(func(st http2.Setting) error {
-				if st.ID == http2.SettingInitialWindowSize {
-					s.mu.Lock()
-					s.peerWindow = int64(st.Val)
-					s.mu.Unlock()
-				}
-				return nil
-			})
-			_ = s.fr.WriteSettingsAck()
-		case *http2.WindowUpdateFrame:
-			s.mu.Lock()
-			s.peerWindow += int64(f.Increment)
-			s.mu.Unlock()
-			select {
-			case <-s.windowReady:
-			default:
-				close(s.windowReady)
-			}
-		case *http2.HeadersFrame:
-			s.dec.SetEmitFunc(func(hf hpack.HeaderField) {
-				if hf.Name == ":status" && len(s.statusCh) == 0 {
-					var status int
-					fmt.Sscanf(hf.Value, "%d", &status)
-					s.statusCh <- status
-				}
-			})
-			s.dec.Write(f.HeaderBlockFragment())
-			if !f.HeadersEnded() {
-				continue
-			}
-			s.dec.SetEmitFunc(func(hpack.HeaderField) {})
-		case *http2.DataFrame:
-			if f.StreamID != h2StreamID {
-				continue
-			}
-			// Give the window back right away; the capsule reader applies
-			// its own backpressure by blocking on the channel.
-			_ = s.fr.WriteWindowUpdate(0, uint32(f.Length))
-			_ = s.fr.WriteWindowUpdate(f.StreamID, uint32(f.Length))
-			select {
-			case s.dataCh <- f.Data():
-			default: // drop when the consumer fell behind; packet loss is
-				// survivable above the IP layer
-			}
-		case *http2.PingFrame:
-			if !f.IsAck() {
-				_ = s.fr.WritePing(true, f.Data)
-			}
-		case *http2.GoAwayFrame:
-			s.mu.Lock()
-			s.readErr = fmt.Errorf("server GOAWAY: %s", f.ErrCode)
-			s.mu.Unlock()
+		if s.handleFrame(f) {
 			return
 		}
+	}
+}
+
+// handleFrame dispatches one read frame. It returns true when the loop
+// must stop (GOAWAY).
+func (s *h2Session) handleFrame(f http2.Frame) bool {
+	switch f := f.(type) {
+	case *http2.SettingsFrame:
+		s.handleSettings(f)
+	case *http2.WindowUpdateFrame:
+		s.mu.Lock()
+		s.peerWindow += int64(f.Increment)
+		s.mu.Unlock()
+		select {
+		case <-s.windowReady:
+		default:
+			close(s.windowReady)
+		}
+	case *http2.HeadersFrame:
+		s.handleHeaders(f)
+	case *http2.DataFrame:
+		s.handleData(f)
+	case *http2.PingFrame:
+		if !f.IsAck() {
+			_ = s.fr.WritePing(true, f.Data)
+		}
+	case *http2.GoAwayFrame:
+		s.mu.Lock()
+		s.readErr = fmt.Errorf("server GOAWAY: %s", f.ErrCode)
+		s.mu.Unlock()
+		return true
+	}
+	return false
+}
+
+// handleSettings answers a peer SETTINGS frame and tracks the initial
+// window size.
+func (s *h2Session) handleSettings(f *http2.SettingsFrame) {
+	if f.IsAck() {
+		return
+	}
+	_ = f.ForeachSetting(func(st http2.Setting) error {
+		if st.ID == http2.SettingInitialWindowSize {
+			s.mu.Lock()
+			s.peerWindow = int64(st.Val)
+			s.mu.Unlock()
+		}
+		return nil
+	})
+	_ = s.fr.WriteSettingsAck()
+}
+
+// handleHeaders decodes the CONNECT response's :status header.
+func (s *h2Session) handleHeaders(f *http2.HeadersFrame) {
+	s.dec.SetEmitFunc(func(hf hpack.HeaderField) {
+		if hf.Name == ":status" && len(s.statusCh) == 0 {
+			var status int
+			_, _ = fmt.Sscanf(hf.Value, "%d", &status)
+			s.statusCh <- status
+		}
+	})
+	_, _ = s.dec.Write(f.HeaderBlockFragment())
+	if f.HeadersEnded() {
+		s.dec.SetEmitFunc(func(hpack.HeaderField) {})
+	}
+}
+
+// handleData feeds tunnel data downstream, returning flow-control credit
+// immediately: the capsule reader applies its own backpressure by blocking
+// on the channel.
+func (s *h2Session) handleData(f *http2.DataFrame) {
+	if f.StreamID != h2StreamID {
+		return
+	}
+	_ = s.fr.WriteWindowUpdate(0, uint32(f.Length))
+	_ = s.fr.WriteWindowUpdate(f.StreamID, uint32(f.Length))
+	select {
+	case s.dataCh <- f.Data():
+	default: // drop when the consumer fell behind; packet loss is
+		// survivable above the IP layer
 	}
 }
 
@@ -313,15 +340,16 @@ func (cr *capsuleReader) next() ([]byte, bool) {
 				return nil, false
 			}
 			cr.buf = cr.buf[n:]
-			cr.want = int(v)
+			// A hostile peer must not make us preallocate gigabytes.
+			if v > maxCapsuleLen {
+				return nil, false
+			}
+			cr.want = int(v) // #nosec G115 -- bounded by maxCapsuleLen above
 			cr.value = make([]byte, 0, cr.want)
 			continue
 		}
 		if cr.want > 0 {
-			take := cr.want
-			if len(cr.buf) < take {
-				take = len(cr.buf)
-			}
+			take := min(len(cr.buf), cr.want)
 			cr.value = append(cr.value, cr.buf[:take]...)
 			cr.buf = cr.buf[take:]
 			cr.want -= take
