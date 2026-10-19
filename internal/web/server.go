@@ -21,6 +21,7 @@ import (
 	"warp-proxy/internal/config"
 	"warp-proxy/internal/health"
 	"warp-proxy/internal/logbuf"
+	"warp-proxy/internal/publicproxy"
 	"warp-proxy/internal/warp"
 
 	"golang.org/x/crypto/bcrypt"
@@ -47,6 +48,11 @@ type Server struct {
 	// EndpointApplier pins a chosen "ip:port" edge endpoint and
 	// reconnects WARP; it returns the rate-limit or command error.
 	EndpointApplier func(ctx context.Context, endpoint string) error
+
+	// PublicPool is the scraped public proxy fallback pool.
+	PublicPool *publicproxy.Pool
+	// PublicScan receives a non-blocking signal per panel scan request.
+	PublicScan chan struct{}
 
 	tpl      *template.Template
 	mu       sync.Mutex
@@ -78,6 +84,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /logs", s.requireAuth(s.showLogs))
 	mux.HandleFunc("POST /logs/clear", s.requireAuth(s.clearLogs))
 	mux.HandleFunc("GET /cleanip", s.requireAuth(s.showCleanIP))
+	mux.HandleFunc("GET /publicproxy", s.requireAuth(s.showPublicProxy))
+	mux.HandleFunc("POST /publicproxy/scan", s.requireAuth(s.doPublicProxyScan))
 	mux.HandleFunc("POST /cleanip/scan", s.requireAuth(s.doCleanIPScan))
 	mux.HandleFunc("POST /cleanip/apply", s.requireAuth(s.doCleanIPApply))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {

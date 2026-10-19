@@ -15,16 +15,17 @@ import (
 // Config is the full application configuration. All durations are stored as
 // strings so the YAML stays human friendly (for example "60s").
 type Config struct {
-	Panel     PanelConfig     `yaml:"panel"`
-	HTTPProxy ListenerConfig  `yaml:"http_proxy"`
-	SOCKS     ListenerConfig  `yaml:"socks_proxy"`
-	Warp      WarpConfig      `yaml:"warp"`
-	Health    HealthConfig    `yaml:"health"`
-	Reconnect ReconnectConfig `yaml:"reconnect"`
-	CleanIP   CleanIPConfig   `yaml:"cleanip"`
-	Front     FrontConfig     `yaml:"front"`
-	Bridge    BridgeConfig    `yaml:"bridge"`
-	Auth      AuthConfig      `yaml:"auth"`
+	Panel       PanelConfig       `yaml:"panel"`
+	HTTPProxy   ListenerConfig    `yaml:"http_proxy"`
+	SOCKS       ListenerConfig    `yaml:"socks_proxy"`
+	Warp        WarpConfig        `yaml:"warp"`
+	Health      HealthConfig      `yaml:"health"`
+	Reconnect   ReconnectConfig   `yaml:"reconnect"`
+	CleanIP     CleanIPConfig     `yaml:"cleanip"`
+	Front       FrontConfig       `yaml:"front"`
+	Bridge      BridgeConfig      `yaml:"bridge"`
+	PublicProxy PublicProxyConfig `yaml:"public_proxy"`
+	Auth        AuthConfig        `yaml:"auth"`
 }
 
 // BridgeConfig configures the OpenAI-compatible AI bridge listener. A
@@ -131,6 +132,43 @@ type HealthConfig struct {
 	BotMarkers []string `yaml:"bot_markers"`
 }
 
+// PublicProxyConfig configures the scraped public proxy fallback pool.
+type PublicProxyConfig struct {
+	// Enabled turns the pool and the bridge fallback on.
+	Enabled bool `yaml:"enabled"`
+	// Interval is how often the sources are rescanned.
+	Interval string `yaml:"interval"`
+	// Max caps the verified pool size (fastest kept).
+	Max int `yaml:"max"`
+	// Workers bounds the concurrent check goroutines.
+	Workers int `yaml:"workers"`
+	// Timeout bounds each fetch and each check request.
+	Timeout string `yaml:"timeout"`
+	// CheckURL is fetched through every candidate; its ip= line names the
+	// exit address.
+	CheckURL string `yaml:"check_url"`
+	// Sources are the list URLs to scrape.
+	Sources []string `yaml:"sources"`
+}
+
+// IntervalDur parses Interval with a 30m default.
+func (c PublicProxyConfig) IntervalDur() time.Duration {
+	d, err := ParseDuration(c.Interval)
+	if err != nil || d <= 0 {
+		return 30 * time.Minute
+	}
+	return d
+}
+
+// TimeoutDur parses Timeout with a 10s default.
+func (c PublicProxyConfig) TimeoutDur() time.Duration {
+	d, err := ParseDuration(c.Timeout)
+	if err != nil || d <= 0 {
+		return 10 * time.Second
+	}
+	return d
+}
+
 // ReconnectConfig rate-limits automatic and manual reconnects.
 type ReconnectConfig struct {
 	MinInterval        string `yaml:"min_interval"`
@@ -196,6 +234,21 @@ func Defaults() *Config {
 			Timeout:              "120s",
 			InjectSession:        true,
 			RotateSessionOnRetry: true,
+		},
+		PublicProxy: PublicProxyConfig{
+			Enabled:  true,
+			Interval: "30m",
+			Max:      100,
+			Workers:  100,
+			Timeout:  "10s",
+			CheckURL: "http://www.cloudflare.com/cdn-cgi/trace",
+			Sources: []string{
+				"https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+				"https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+				"https://sunny9577.github.io/proxy-scraper/generated/socks5_proxies.txt",
+				"https://sunny9577.github.io/proxy-scraper/generated/http_proxies.txt",
+				"https://raw.githubusercontent.com/berkay-digital/Proxy-Scraper/main/proxies.txt",
+			},
 		},
 		Auth: AuthConfig{Username: "admin"},
 	}

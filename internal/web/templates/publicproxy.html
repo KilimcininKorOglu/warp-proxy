@@ -1,0 +1,36 @@
+{{template "head" .}}
+
+<div class="card">
+  <h2>Public proxy havuzu</h2>
+  <table>
+    <tr><th>Durum</th>
+      <td>{{if .Enabled}}{{if .Running}}<span class="pill warn">tarama sürüyor</span>{{else}}<span class="pill ok">açık</span>{{end}}
+      {{else}}<span class="pill err">kapalı (ayarlar → public_proxy.enabled)</span>{{end}}</td></tr>
+    <tr><th>Havuz</th><td>{{.Count}} doğrulanmış proxy</td></tr>
+    <tr><th>Son tarama</th>
+      <td>{{if .LastScan.IsZero}}<span class="muted">yok</span>{{else}}{{.LastScan.Format "02.01.2006 15:04:05"}}
+        <span class="muted">({{.Kept}}/{{.Seen}} aday kaldı)</span>{{end}}</td></tr>
+    <tr><th>Tarama aralığı</th><td>{{.Interval}}</td></tr>
+  </table>
+  <p>
+    <form class="inline" method="post" action="/publicproxy/scan">
+      <button type="submit" {{if or .Running (not .Enabled)}}disabled{{end}}>Şimdi tara</button>
+    </form>
+    <span class="muted">Kaynak listeleri indirir, her adayı gerçek istekle doğrular; geçenler gecikmeye göre sıralanır.</span>
+  </p>
+</div>
+
+<div class="card">
+  <h2>Doğrulanmış proxy'ler</h2>
+  {{if .Entries}}
+  <table class="log">
+    <tr><th>#</th><th>Adres</th><th>Tip</th><th>Gecikme</th><th>Çıkış IP</th><th>Kontrol</th></tr>
+    {{range $i, $e := .Entries}}
+    <tr><td>{{$i}}</td><td>{{$e.Addr}}</td><td>{{$e.Scheme}}</td>
+      <td>{{$e.Latency.Milliseconds}} ms</td><td>{{$e.ExitIP}}</td>
+      <td>{{$e.CheckedAt.Format "15:04:05"}}</td></tr>
+    {{end}}
+  </table>
+  {{else}}<p class="muted">Havuz boş. Bir tarama çalıştırın veya public_proxy.enabled'i açın.</p>{{end}}
+</div>
+{{template "foot" .}}

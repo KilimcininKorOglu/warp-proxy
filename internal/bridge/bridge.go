@@ -51,6 +51,10 @@ type Server struct {
 	Rotate func(ctx context.Context) error
 	// Cfg is read on every request so panel edits apply immediately.
 	Cfg func() config.BridgeConfig
+	// Public, when set, returns a transport bound to the next public
+	// proxy in the pool, or nil when the pool is empty. It is the last
+	// resort after the WARP retries are exhausted.
+	Public func(ctx context.Context) *http.Transport
 
 	sem  chan struct{}
 	mu   sync.Mutex
@@ -132,12 +136,38 @@ func (s *Server) replay(r *http.Request, body []byte,
 	for attempt := 0; ; attempt++ {
 		resp, err := s.roundTrip(r, body, cfg, ids)
 		if err != nil || !retryable(cfg, resp.StatusCode) || attempt == attempts {
+			if err == nil && retryable(cfg, resp.StatusCode) {
+				if fb := s.fallback(r, body, cfg, ids); fb != nil {
+					resp.Body.Close()
+					return fb, nil
+				}
+			}
 			return resp, err
 		}
 		if err := s.prepareReplay(r, resp, cfg, ids); err != nil {
 			return nil, err
 		}
 	}
+}
+
+// fallback retries the request once through a public proxy after the WARP
+// retries are exhausted; nil when the pool is disabled or empty.
+func (s *Server) fallback(r *http.Request, body []byte,
+	cfg config.BridgeConfig, ids *identity) *http.Response {
+	if s.Public == nil {
+		return nil
+	}
+	tr := s.Public(r.Context())
+	if tr == nil {
+		return nil
+	}
+	s.note("warn", "WARP retries exhausted on %s, falling back to a public proxy", r.URL.Path)
+	resp, err := s.roundTripVia(r, body, cfg, ids, tr)
+	if err != nil {
+		s.note("warn", "public proxy fallback failed: %v", err)
+		return nil
+	}
+	return resp
 }
 
 // errClientCanceled reports that the client went away while the bridge waited
@@ -212,6 +242,13 @@ func isUsageLimitError(resp *http.Response) bool {
 
 // roundTrip forwards the buffered request to the upstream once.
 func (s *Server) roundTrip(r *http.Request, body []byte, cfg config.BridgeConfig, ids *identity) (*http.Response, error) {
+	transport := &http.Transport{DialContext: s.Upstream.Dial}
+	return s.roundTripVia(r, body, cfg, ids, transport)
+}
+
+// roundTripVia sends the buffered request through the given transport.
+func (s *Server) roundTripVia(r *http.Request, body []byte, cfg config.BridgeConfig,
+	ids *identity, transport *http.Transport) (*http.Response, error) {
 	ctx, cancel := context.WithTimeout(r.Context(), cfg.TimeoutDur())
 	defer cancel()
 
@@ -227,7 +264,6 @@ func (s *Server) roundTrip(r *http.Request, body []byte, cfg config.BridgeConfig
 	ids.apply(req.Header)
 	req.Host = req.URL.Host
 
-	transport := &http.Transport{DialContext: s.Upstream.Dial}
 	return transport.RoundTrip(req)
 }
 

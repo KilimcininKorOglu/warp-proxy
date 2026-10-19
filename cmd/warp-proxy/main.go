@@ -21,6 +21,7 @@ import (
 	"warp-proxy/internal/health"
 	"warp-proxy/internal/logbuf"
 	"warp-proxy/internal/proxy"
+	"warp-proxy/internal/publicproxy"
 	"warp-proxy/internal/warp"
 	"warp-proxy/internal/web"
 
@@ -100,7 +101,15 @@ func main() {
 	httpSrv := &proxy.HTTPServer{Upstream: upstream, Log: logger, OnRequest: logSink.request}
 	socksSrv := &proxy.SOCKSServer{Upstream: upstream}
 
+	// The public proxy pool: scraped lists, verified with real requests,
+	// used by the bridge as the last-resort exit after WARP retries.
+	pool := &publicproxy.Pool{}
+	panelScan := make(chan struct{}, 1)
+	go runPublicProxyPool(ctx, pool, panelScan, cfg, logs)
+
 	panel := web.New()
+	panel.PublicPool = pool
+	panel.PublicScan = panelScan
 	panel.ConfigPath = *configPath
 	panel.GetConfig = func() *config.Config { return cfg }
 	panel.SaveConfig = func(c *config.Config) error { return config.Save(*configPath, c) }
@@ -164,14 +173,7 @@ func main() {
 	go func() { errCh <- socksSrv.Serve(lnSOCKS) }()
 
 	if cfg.Bridge.Enabled {
-		bridgeSrv := bridge.New(checkerUpstream, logs, logger,
-			checker.ManualReconnect, func() config.BridgeConfig { return cfg.Bridge })
-		lnBridge, err := net.Listen("tcp", cfg.Bridge.Listen)
-		if err != nil {
-			logger.Error("bridge listen failed", "addr", cfg.Bridge.Listen, "err", err)
-			os.Exit(1)
-		}
-		go func() { errCh <- http.Serve(lnBridge, bridgeSrv) }()
+		startBridge(errCh, cfg, checker, checkerUpstream, pool, logs, logger)
 	}
 
 	logger.Info("warp-proxy started",
@@ -248,6 +250,61 @@ func healthInterval(cfg *config.Config) time.Duration {
 		return 5 * time.Minute
 	}
 	return d
+}
+
+// startBridge runs the OpenAI-compatible bridge listener with the public
+// proxy fallback attached; a listener failure is fatal.
+func startBridge(errCh chan error, cfg *config.Config, checker *health.Checker,
+	upstream *proxy.Upstream, pool *publicproxy.Pool, logs *logbuf.Buffer,
+	logger *slog.Logger) {
+	srv := bridge.New(upstream, logs, logger,
+		checker.ManualReconnect, func() config.BridgeConfig { return cfg.Bridge })
+	srv.Public = func(_ context.Context) *http.Transport {
+		if !cfg.PublicProxy.Enabled {
+			return nil
+		}
+		return pool.Transport()
+	}
+	ln, err := net.Listen("tcp", cfg.Bridge.Listen)
+	if err != nil {
+		logger.Error("bridge listen failed", "addr", cfg.Bridge.Listen, "err", err)
+		os.Exit(1)
+	}
+	go func() { errCh <- http.Serve(ln, srv) }()
+}
+
+// runPublicProxyPool refreshes the scraped public proxy pool on its
+// configured interval and on panel scan requests, until ctx ends.
+func runPublicProxyPool(ctx context.Context, pool *publicproxy.Pool,
+	panelScan <-chan struct{}, cfg *config.Config, logs *logbuf.Buffer) {
+	if !cfg.PublicProxy.Enabled {
+		return
+	}
+	scan := func() {
+		c := cfg.PublicProxy
+		seen, kept := pool.Refresh(ctx, c.Sources, c.CheckURL, c.TimeoutDur(),
+			c.Max, c.Workers, func(f string, a ...any) {
+				logs.Add("info", "publicproxy", f, a...)
+			})
+		if kept > 0 {
+			logs.Add("info", "publicproxy", "pool refreshed: %d/%d proxies verified", kept, seen)
+		} else {
+			logs.Add("warn", "publicproxy", "pool empty after scan (%d candidates)", seen)
+		}
+	}
+	scan()
+	ticker := time.NewTicker(cfg.PublicProxy.IntervalDur())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			scan()
+		case <-panelScan:
+			scan()
+		}
+	}
 }
 
 // runStartupDedupe evens out the round-robin pool's exit IPs once after
