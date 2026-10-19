@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"warp-proxy/internal/cleanip"
@@ -63,20 +64,41 @@ func (s *Server) doCleanIPScan(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/cleanip", http.StatusSeeOther)
 }
 
+// applyEndpoint reads the chosen endpoint from the apply form: either a
+// combined "host:port" (home-edge scan results) or separate ip and port
+// fields. bad reports an unusable value.
+func applyEndpoint(r *http.Request) (string, bool) {
+	if combined := r.FormValue("ip"); strings.Contains(combined, ":") {
+		host, port, err := net.SplitHostPort(combined)
+		if err != nil || net.ParseIP(host) == nil {
+			return "", true
+		}
+		p, perr := strconv.Atoi(port)
+		if perr != nil || p < 1 || p > 65535 {
+			return "", true
+		}
+		return net.JoinHostPort(host, port), false
+	}
+	ip := net.ParseIP(r.FormValue("ip"))
+	port, err := strconv.Atoi(r.FormValue("port"))
+	if ip == nil || err != nil || port < 1 || port > 65535 {
+		return "", true
+	}
+	return net.JoinHostPort(ip.String(), strconv.Itoa(port)), false
+}
+
 // doCleanIPApply pins the chosen edge endpoint and reconnects WARP.
 func (s *Server) doCleanIPApply(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "form parse failed", http.StatusBadRequest)
 		return
 	}
-	ip := net.ParseIP(r.FormValue("ip"))
-	port, err := strconv.Atoi(r.FormValue("port"))
-	if ip == nil || err != nil || port < 1 || port > 65535 {
+	endpoint, bad := applyEndpoint(r)
+	if bad {
 		s.Logs.Add("warn", "cleanip", "apply rejected: bad endpoint form values")
 		http.Redirect(w, r, "/cleanip", http.StatusSeeOther)
 		return
 	}
-	endpoint := net.JoinHostPort(ip.String(), strconv.Itoa(port))
 	if s.EndpointApplier == nil {
 		s.Logs.Add("error", "cleanip", "apply unavailable: endpoint applier missing")
 		http.Redirect(w, r, "/cleanip", http.StatusSeeOther)
